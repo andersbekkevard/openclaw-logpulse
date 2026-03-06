@@ -2,9 +2,187 @@ use crate::event::{NormalizedEvent, Severity, ToolEventKind};
 use crate::parser::ParsedLine;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use std::collections::HashSet;
 
 const MAX_PARAM_VALUE_LENGTH: usize = 120;
 const MAX_PARAM_COUNT: usize = 4;
+
+const SESSION_PATHS: &[&[&str]] = &[
+    &["session_key"],
+    &["session-key"],
+    &["sessionId"],
+    &["session_id"],
+    &["sid"],
+    &["session", "id"],
+    &["session", "session_id"],
+    &["session", "sessionId"],
+    &["meta", "session"],
+    &["metadata", "session_id"],
+    &["metadata", "session"],
+    &["context", "session_id"],
+    &["context", "session"],
+    &["payload", "session_id"],
+    &["payload", "session"],
+];
+
+const AGENT_PATHS: &[&[&str]] = &[
+    &["agent_id"],
+    &["agentId"],
+    &["agent", "id"],
+    &["agent", "agent_id"],
+    &["agent", "identifier"],
+    &["meta", "agent_id"],
+    &["metadata", "agent_id"],
+    &["metadata", "agentId"],
+    &["context", "agent_id"],
+    &["source", "agent_id"],
+];
+
+const TOOL_PATHS: &[&[&str]] = &[
+    &["tool_name"],
+    &["toolName"],
+    &["tool"],
+    &["name"],
+    &["operation"],
+    &["tool_call", "tool"],
+    &["tool_call", "name"],
+    &["metadata", "tool"],
+    &["metadata", "tool_name"],
+];
+
+const CORRELATION_ID_PATHS: &[&[&str]] = &[
+    &["call_id"],
+    &["callId"],
+    &["tool_call_id"],
+    &["toolCallId"],
+    &["request_id"],
+    &["requestId"],
+    &["correlation_id"],
+    &["correlationId"],
+    &["event", "id"],
+    &["tool_call", "id"],
+    &["tool_call", "call_id"],
+    &["tool_call", "callId"],
+    &["tool_call", "request_id"],
+    &["tool_call", "requestId"],
+    &["request", "id"],
+    &["request", "request_id"],
+    &["request", "requestId"],
+    &["meta", "request_id"],
+    &["metadata", "request_id"],
+    &["metadata", "call_id"],
+    &["context", "request_id"],
+    &["payload", "request_id"],
+];
+
+const TIMESTAMP_PATHS: &[&[&str]] = &[
+    &["timestamp"],
+    &["time"],
+    &["ts"],
+    &["@timestamp"],
+    &["logged_at"],
+    &["loggedAt"],
+    &["created_at"],
+    &["createdAt"],
+    &["event", "timestamp"],
+    &["meta", "timestamp"],
+    &["metadata", "timestamp"],
+    &["context", "timestamp"],
+    &["payload", "timestamp"],
+    &["log", "timestamp"],
+];
+
+const KIND_HINT_PATHS: &[&[&str]] = &[
+    &["event"],
+    &["type"],
+    &["kind"],
+    &["state"],
+    &["status"],
+    &["action"],
+    &["operation"],
+    &["event", "type"],
+    &["event", "name"],
+    &["metadata", "event"],
+    &["metadata", "type"],
+    &["metadata", "kind"],
+    &["tool_call", "state"],
+    &["tool_call", "type"],
+    &["tool_call", "status"],
+];
+
+const PARAM_PATHS: &[&[&str]] = &[
+    &["parameters"],
+    &["params"],
+    &["arguments"],
+    &["args"],
+    &["input"],
+    &["tool_call", "parameters"],
+    &["tool_call", "params"],
+    &["tool_call", "arguments"],
+    &["tool_call", "args"],
+    &["meta", "params"],
+    &["metadata", "params"],
+    &["payload", "params"],
+];
+
+const RESULT_SUMMARY_PATHS: &[&[&str]] = &[
+    &["result_summary"],
+    &["summary"],
+    &["result", "summary"],
+    &["result", "message"],
+    &["output", "summary"],
+    &["error", "message"],
+    &["tool_call", "result", "summary"],
+    &["tool_call", "error", "message"],
+];
+
+const RESULT_PATHS: &[&[&str]] = &[
+    &["result"],
+    &["output"],
+    &["response"],
+    &["response", "result"],
+    &["tool_call", "result"],
+    &["tool_call", "output"],
+    &["tool_result"],
+];
+
+const ERROR_PATHS: &[&[&str]] = &[
+    &["error"],
+    &["tool_call", "error"],
+    &["payload", "error"],
+    &["metadata", "error"],
+];
+
+const MESSAGE_PATHS: &[&[&str]] = &[
+    &["message"],
+    &["msg"],
+    &["event", "message"],
+    &["metadata", "message"],
+    &["meta", "message"],
+    &["tool_call", "message"],
+    &["payload", "message"],
+];
+
+const LEVEL_PATHS: &[&[&str]] = &[
+    &["level"],
+    &["severity"],
+    &["log_level"],
+    &["severityText"],
+    &["severity_text"],
+    &["lvl"],
+    &["metadata", "level"],
+    &["meta", "level"],
+];
+
+const STATUS_PATHS: &[&[&str]] = &[
+    &["status"],
+    &["result_status"],
+    &["result", "status"],
+    &["tool_call", "status"],
+    &["outcome"],
+    &["result", "outcome"],
+    &["metadata", "status"],
+];
 
 pub fn normalize(line: &str) -> NormalizedEvent {
     match crate::parser::parse_line(line) {
@@ -19,6 +197,7 @@ pub fn normalize(line: &str) -> NormalizedEvent {
             status: None,
             result_summary: Some(reason),
             call_id: None,
+            correlation_ids: Vec::new(),
             level: Severity::Unknown,
             level_raw: None,
             params: Vec::new(),
@@ -30,100 +209,49 @@ pub fn normalize(line: &str) -> NormalizedEvent {
 }
 
 fn normalize_json(raw: &str, value: &Value) -> NormalizedEvent {
-    let obj = match value.as_object() {
-        Some(map) => map,
-        None => {
-            return NormalizedEvent {
-                kind: ToolEventKind::Other,
-                timestamp: None,
-                timestamp_raw: Some(raw.to_string()),
-                session_key: None,
-                session_id: None,
-                agent_id: None,
-                tool_name: None,
-                status: None,
-                result_summary: Some("non-object json entry".to_string()),
-                call_id: None,
-                level: Severity::Unknown,
-                level_raw: None,
-                params: Vec::new(),
-                message: Some(raw.to_string()),
-                raw_line: raw.to_string(),
-            };
-        }
-    };
+    if value.as_object().is_none() {
+        return NormalizedEvent {
+            kind: ToolEventKind::Malformed,
+            timestamp: None,
+            timestamp_raw: Some(raw.to_string()),
+            session_key: None,
+            session_id: None,
+            agent_id: None,
+            tool_name: None,
+            status: None,
+            result_summary: Some("non-object json entry".to_string()),
+            call_id: None,
+            correlation_ids: Vec::new(),
+            level: Severity::Unknown,
+            level_raw: None,
+            params: Vec::new(),
+            message: Some(raw.to_string()),
+            raw_line: raw.to_string(),
+        };
+    }
 
-    let (timestamp, timestamp_raw) = parse_timestamp(obj);
-    let level_raw = first_string(
-        obj,
-        &["level", "severity", "log_level", "severityText", "lvl"],
-    );
+    let (timestamp, timestamp_raw) = parse_timestamp(value);
+    let level_raw = first_string_from_paths(value, LEVEL_PATHS);
     let level = level_raw
         .as_deref()
         .map(Severity::from_string)
         .unwrap_or(Severity::Unknown);
 
-    let session_key = first_string(
-        obj,
-        &[
-            "session_key",
-            "session-key",
-            "sessionId",
-            "sessionIdentifier",
-        ],
-    );
-    let session_id = first_string(obj, &["session_id", "sid"])
-        .or_else(|| first_string_from_nested(obj, &["session", "id"]));
+    let session_key = first_string_from_paths(value, SESSION_PATHS);
+    let session_id = session_key.clone();
 
-    let agent_id = first_string(obj, &["agent_id", "agent", "source", "agentId"])
-        .or_else(|| first_string_from_nested(obj, &["agent", "id"]));
+    let agent_id = first_string_from_paths(value, AGENT_PATHS);
+    let tool_name = first_string_from_paths(value, TOOL_PATHS);
 
-    let tool_name = first_string(
-        obj,
-        &[
-            "tool_name",
-            "tool",
-            "toolName",
-            "name",
-            "operation",
-            "toolCall",
-        ],
-    )
-    .or_else(|| first_string_from_nested(obj, &["tool_call", "name"]));
+    let correlation_ids = collect_call_ids(value);
+    let call_id = correlation_ids.first().cloned();
 
-    let call_id = first_string(
-        obj,
-        &[
-            "call_id",
-            "callId",
-            "tool_call_id",
-            "request_id",
-            "correlation_id",
-            "requestId",
-        ],
-    )
-    .or_else(|| first_string_from_nested(obj, &["tool_call", "id"]));
+    let status = extract_status(value);
+    let result_summary = extract_result_summary(value);
+    let message = first_string_from_paths(value, MESSAGE_PATHS);
 
-    let status = first_string(obj, &["status", "result_status", "outcome", "result"])
-        .or_else(|| {
-            value.get("ok").and_then(|value| value.as_bool()).map(|ok| {
-                if ok {
-                    "ok".to_string()
-                } else {
-                    "error".to_string()
-                }
-            })
-        })
-        .or_else(|| first_string(obj, &["error"]));
-
-    let result_summary = first_string(obj, &["result_summary", "summary"])
-        .or_else(|| first_string_from_nested(obj, &["result", "summary"]));
-
-    let kind = infer_kind(obj, raw);
+    let kind = infer_kind(value, raw, status.as_deref(), &correlation_ids);
     let params = extract_params(value);
-
-    let message = first_string(obj, &["message", "msg"])
-        .or_else(|| first_string_from_nested(obj, &["event", "message"]));
 
     NormalizedEvent {
         kind,
@@ -136,6 +264,7 @@ fn normalize_json(raw: &str, value: &Value) -> NormalizedEvent {
         status,
         result_summary,
         call_id,
+        correlation_ids,
         level,
         level_raw,
         params,
@@ -144,62 +273,98 @@ fn normalize_json(raw: &str, value: &Value) -> NormalizedEvent {
     }
 }
 
-fn infer_kind(obj: &serde_json::Map<String, Value>, raw: &str) -> ToolEventKind {
-    let event_type = first_string(
-        obj,
-        &["event", "type", "action", "operation", "kind", "state"],
-    )
-    .unwrap_or_default()
-    .to_ascii_lowercase();
+fn infer_kind(
+    value: &Value,
+    raw: &str,
+    status: Option<&str>,
+    correlation_ids: &[String],
+) -> ToolEventKind {
+    let mut event_type = first_string_from_paths(value, KIND_HINT_PATHS)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    event_type.push(' ');
+    event_type.push_str(&raw.to_ascii_lowercase());
 
-    let joined = format!("{} {}", event_type, raw.to_ascii_lowercase());
+    if has_any_fields(value, ERROR_PATHS) && has_call_marker(&event_type) {
+        return ToolEventKind::ToolCallResult;
+    }
 
     if contains_any(
-        &joined,
+        &event_type,
         &[
-            "tool_call",
-            "toolcall",
+            "tool_call_error",
+            "tool_error",
+            "toolcall_error",
+            "error",
+            "error_event",
+            "failed",
+            "exception",
+            "tool_call_exception",
+        ],
+    ) {
+        return ToolEventKind::ToolCallResult;
+    }
+
+    if contains_any(
+        &event_type,
+        &[
+            "tool_call_start",
+            "tool_call.started",
+            "tool_call_starting",
+            "tool_call.create",
+            "tool_start",
             "call_start",
             "started",
+            "invoking",
             "invoked",
-            "invocation",
         ],
     ) {
         return ToolEventKind::ToolCallStart;
     }
 
     if contains_any(
-        &joined,
+        &event_type,
         &[
+            "tool_call_result",
+            "tool_call.done",
+            "tool_call.complete",
+            "toolresult",
+            "call_result",
             "result",
             "completed",
             "finished",
             "done",
-            "tool_result",
-            "toolresult",
+            "success",
+            "ok",
         ],
     ) {
         return ToolEventKind::ToolCallResult;
     }
 
-    if has_result_fields(obj) {
+    if has_result_fields(value) {
         return ToolEventKind::ToolCallResult;
     }
 
-    if has_call_fields(obj) {
+    if has_call_fields(value) {
         return ToolEventKind::ToolCallStart;
     }
 
+    if correlation_ids.len() > 1 {
+        return ToolEventKind::ToolCallStart;
+    }
+
+    if let Some(value) = status {
+        if matches!(
+            value.to_ascii_lowercase().as_str(),
+            "ok" | "done" | "success" | "error" | "fail" | "failed"
+        ) {
+            return ToolEventKind::ToolCallResult;
+        }
+    }
+
     if has_any_fields(
-        obj,
-        &[
-            "tool",
-            "tool_name",
-            "toolName",
-            "name",
-            "params",
-            "arguments",
-        ],
+        value,
+        &[&["tool_name"], &["tool"], &["toolName"], &["operation"]],
     ) {
         return ToolEventKind::ToolCall;
     }
@@ -207,46 +372,127 @@ fn infer_kind(obj: &serde_json::Map<String, Value>, raw: &str) -> ToolEventKind 
     ToolEventKind::Other
 }
 
-fn has_result_fields(obj: &serde_json::Map<String, Value>) -> bool {
-    obj.contains_key("result")
-        || obj.contains_key("output")
-        || obj.contains_key("status")
-        || obj.contains_key("error")
-        || obj.contains_key("exit_code")
+fn has_call_marker(value: &str) -> bool {
+    contains_any(
+        value,
+        &[
+            "tool_call",
+            "call_start",
+            "call",
+            "toolcall",
+            "tool call",
+            "tool invocation",
+        ],
+    )
 }
 
-fn has_call_fields(obj: &serde_json::Map<String, Value>) -> bool {
-    obj.contains_key("tool")
-        || obj.contains_key("tool_name")
-        || obj.contains_key("toolName")
-        || obj.contains_key("params")
-        || obj.contains_key("arguments")
-        || obj.contains_key("args")
+fn has_call_fields(value: &Value) -> bool {
+    has_any_fields(
+        value,
+        &[
+            &["tool"],
+            &["tool_name"],
+            &["toolName"],
+            &["name"],
+            &["params"],
+            &["arguments"],
+            &["args"],
+            &["tool_call", "tool"],
+            &["tool_call", "name"],
+            &["tool_call", "params"],
+            &["tool_call", "arguments"],
+        ],
+    )
 }
 
-fn has_any_fields(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> bool {
-    keys.iter().any(|key| obj.contains_key(*key))
+fn has_result_fields(value: &Value) -> bool {
+    has_any_fields(
+        value,
+        &[
+            &["result"],
+            &["output"],
+            &["response"],
+            &["tool_result"],
+            &["exit_code"],
+            &["tool_call", "result"],
+            &["tool_call", "output"],
+            &["error"],
+            &["tool_call", "error"],
+        ],
+    )
+}
+
+fn has_any_fields(value: &Value, paths: &[&[&str]]) -> bool {
+    paths
+        .iter()
+        .any(|path| first_value_from_paths(value, &[*path]).is_some())
+}
+
+fn collect_call_ids(value: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for key in CORRELATION_ID_PATHS {
+        if let Some(id) = first_string_from_paths(value, &[*key]) {
+            if seen.insert(id.clone()) {
+                ids.push(id);
+            }
+        }
+    }
+
+    ids
+}
+
+fn extract_status(value: &Value) -> Option<String> {
+    if let Some(status) = first_string_from_paths(value, STATUS_PATHS) {
+        return Some(status);
+    }
+
+    value.get("ok").and_then(|value| value.as_bool()).map(|ok| {
+        if ok {
+            "ok".to_string()
+        } else {
+            "error".to_string()
+        }
+    })
+}
+
+fn extract_result_summary(value: &Value) -> Option<String> {
+    if let Some(summary) = first_string_from_paths(value, RESULT_SUMMARY_PATHS) {
+        return Some(summary);
+    }
+
+    if let Some(error) = first_value_from_paths(value, ERROR_PATHS) {
+        return Some(value_summary(error));
+    }
+
+    if let Some(result) = first_value_from_paths(value, RESULT_PATHS) {
+        return Some(value_summary(result));
+    }
+
+    first_string_from_paths(value, &[&["result_summary"], &["message"], &["msg"]])
 }
 
 fn extract_params(value: &Value) -> Vec<(String, String)> {
-    let values = ["parameters", "params", "arguments", "args", "input"]
-        .iter()
-        .find_map(|key| value.get(*key))
-        .map(|value| match value {
-            Value::Object(map) => map
+    let values = first_value_from_paths(value, PARAM_PATHS).map(|value| match value {
+        Value::Object(map) => {
+            let mut pairs = map
                 .iter()
-                .map(|(key, value)| (key.clone(), value_summary(value)))
-                .collect::<Vec<_>>(),
-            Value::Array(values) => values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| (format!("arg_{index}"), value_summary(value)))
-                .collect::<Vec<_>>(),
-            _ => Vec::new(),
-        })
-        .unwrap_or_default();
+                .map(|(key, value)| (key.to_string(), value_summary(value)))
+                .collect::<Vec<_>>();
+            pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            pairs
+        }
+        Value::Array(values) => values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (format!("arg_{index}"), value_summary(value)))
+            .collect::<Vec<_>>(),
+        value => vec![("value".to_string(), value_summary(value))],
+    });
 
     values
+        .unwrap_or_default()
         .into_iter()
         .take(MAX_PARAM_COUNT)
         .map(|(key, value)| {
@@ -258,6 +504,82 @@ fn extract_params(value: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
+fn parse_timestamp(value: &Value) -> (Option<DateTime<Utc>>, Option<String>) {
+    for path in TIMESTAMP_PATHS {
+        if let Some(value) = first_value_from_paths(value, &[*path]) {
+            if let Some(timestamp) = parse_timestamp_value(value) {
+                let raw = match value {
+                    Value::String(value) => Some(value.to_string()),
+                    _ => Some(value.to_string()),
+                };
+                return (Some(timestamp), raw);
+            }
+        }
+    }
+
+    (None, None)
+}
+
+fn parse_timestamp_value(value: &Value) -> Option<DateTime<Utc>> {
+    match value {
+        Value::String(value) => parse_timestamp_str(value)
+            .or_else(|| value.parse::<f64>().ok().and_then(parse_epoch_timestamp)),
+        Value::Number(value) => value.as_f64().and_then(parse_epoch_timestamp),
+        _ => None,
+    }
+}
+
+fn parse_timestamp_str(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .or_else(|| {
+            DateTime::parse_from_rfc2822(value)
+                .ok()
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+        })
+}
+
+fn parse_epoch_timestamp(value: f64) -> Option<DateTime<Utc>> {
+    if !value.is_finite() {
+        return None;
+    }
+
+    let abs = value.abs();
+    let scaled = if abs >= 1_000_000_000_000_000_000.0 {
+        value / 1_000_000_000.0
+    } else if abs >= 1_000_000_000_000_000.0 {
+        value / 1_000_000.0
+    } else if abs >= 1_000_000_000.0 {
+        value / 1_000.0
+    } else {
+        value
+    };
+
+    let secs = scaled.floor() as i64;
+    let nanos = ((scaled - secs as f64).abs() * 1_000_000_000.0).round() as u32;
+
+    DateTime::from_timestamp(secs, nanos)
+}
+
+fn first_string_from_paths(value: &Value, paths: &[&[&str]]) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|path| first_value_from_paths(value, &[*path]).and_then(value_to_string))
+}
+
+fn first_value_from_paths<'a>(value: &'a Value, paths: &[&[&str]]) -> Option<&'a Value> {
+    paths.iter().find_map(|path| get_value_by_path(value, path))
+}
+
+fn get_value_by_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
 fn value_summary(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
@@ -267,55 +589,6 @@ fn value_summary(value: &Value) -> String {
         Value::Array(values) => format!("array(len={})", values.len()),
         Value::Object(map) => format!("object(len={})", map.len()),
     }
-}
-
-fn parse_timestamp(
-    obj: &serde_json::Map<String, Value>,
-) -> (Option<DateTime<Utc>>, Option<String>) {
-    for key in [
-        "timestamp",
-        "time",
-        "ts",
-        "@timestamp",
-        "logged_at",
-        "created_at",
-    ] {
-        if let Some(value) = obj.get(key) {
-            if let Some(ts_string) = value.as_str() {
-                if let Ok(ts) = DateTime::parse_from_rfc3339(ts_string) {
-                    return (Some(ts.with_timezone(&Utc)), Some(ts_string.to_string()));
-                }
-            }
-
-            if let Some(v) = value.as_i64() {
-                return (Some(timestamp_from_epoch(v as f64)), Some(v.to_string()));
-            }
-
-            if let Some(v) = value.as_f64() {
-                return (Some(timestamp_from_epoch(v)), Some(v.to_string()));
-            }
-        }
-    }
-
-    (None, None)
-}
-
-fn timestamp_from_epoch(value: f64) -> DateTime<Utc> {
-    let secs = value.floor() as i64;
-    let nanos = ((value - secs as f64) * 1_000_000_000.0).clamp(0.0, 999_999_999.0) as u32;
-    DateTime::<Utc>::from_timestamp(secs, nanos).unwrap_or_else(Utc::now)
-}
-
-fn first_string(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| obj.get(*key).and_then(value_to_string))
-}
-
-fn first_string_from_nested(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
-    let (head, tail) = keys.split_first()?;
-    obj.get(*head)
-        .and_then(Value::as_object)
-        .and_then(|child| first_string(child, tail))
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -355,10 +628,38 @@ mod tests {
         let normalized = normalize(line);
         assert_eq!(normalized.session_key.as_deref(), Some("session-123"));
         assert_eq!(normalized.tool_name.as_deref(), Some("search"));
+        assert_eq!(normalized.call_id.as_deref(), Some("abc"));
+        assert_eq!(normalized.correlation_ids, vec!["abc".to_string()]);
         assert!(matches!(
             normalized.kind,
             crate::event::ToolEventKind::ToolCallStart
         ));
+    }
+
+    #[test]
+    fn parse_tool_call_result_with_request_id_only() {
+        let line = r#"{"event":"tool_call_result","tool":"shell","request_id":"req-1","status":"ok","params":{"value":"x"}}"#;
+        let normalized = normalize(line);
+        assert_eq!(normalized.call_id.as_deref(), Some("req-1"));
+        assert_eq!(normalized.status.as_deref(), Some("ok"));
+        assert_eq!(normalized.params.len(), 1);
+        assert!(matches!(
+            normalized.kind,
+            crate::event::ToolEventKind::ToolCallResult
+        ));
+    }
+
+    #[test]
+    fn parse_nested_openclaw_error_event() {
+        let line = r#"{"type":"tool","tool_call":{"tool":"shell","event":"error","id":"call-3","error":{"message":"quota exceeded","code":429}},"session":{"id":"session-3"}}"#;
+        let normalized = normalize(line);
+        assert_eq!(normalized.tool_name.as_deref(), Some("shell"));
+        assert_eq!(normalized.call_id.as_deref(), Some("call-3"));
+        assert!(matches!(
+            normalized.kind,
+            crate::event::ToolEventKind::ToolCallResult
+        ));
+        assert!(normalized.result_summary.is_some());
     }
 
     #[test]
@@ -367,5 +668,15 @@ mod tests {
         let normalized = normalize(line);
         assert_eq!(normalized.status.as_deref(), Some("ok"));
         assert_eq!(normalized.params.len(), 1);
+    }
+
+    #[test]
+    fn parse_non_object_json_as_malformed() {
+        let normalized = normalize("\"plain string\"");
+        assert!(matches!(
+            normalized.kind,
+            crate::event::ToolEventKind::Malformed
+        ));
+        assert!(normalized.result_summary.is_some());
     }
 }

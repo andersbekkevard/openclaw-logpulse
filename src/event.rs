@@ -64,6 +64,8 @@ pub struct NormalizedEvent {
     pub status: Option<String>,
     pub result_summary: Option<String>,
     pub call_id: Option<String>,
+    #[serde(skip)]
+    pub correlation_ids: Vec<String>,
     pub level: Severity,
     pub level_raw: Option<String>,
     pub params: Vec<(String, String)>,
@@ -78,7 +80,7 @@ impl NormalizedEvent {
         tool_name: Option<&String>,
         min_level: Severity,
     ) -> bool {
-        if !min_level.should_emit(self.level) {
+        if !self.level.should_emit(min_level) {
             return false;
         }
 
@@ -108,5 +110,21 @@ impl NormalizedEvent {
         }
 
         true
+    }
+
+    pub fn all_call_ids(&self) -> impl Iterator<Item = &str> {
+        self.call_id
+            .as_deref()
+            .into_iter()
+            .chain(self.correlation_ids.iter().map(|value| value.as_str()))
+    }
+
+    pub fn fallback_signature(&self) -> Option<String> {
+        let session = self.session_key.as_ref().or(self.session_id.as_ref())?;
+        let tool = self.tool_name.as_ref()?;
+        Some(format!(
+            "{session}|{tool}|{}",
+            self.agent_id.as_deref().unwrap_or("-")
+        ))
     }
 }

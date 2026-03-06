@@ -1,0 +1,3 @@
+{"event":"tool_call_start","session_key":"session-malformed","tool":"shell","call_id":"single-good","status":"started","level":"info"}
+<not-json-line>
+{"event":"tool_call_result","session_key":"session-malformed","tool":"shell","call_id":"single-good","status":"ok","level":"info"}

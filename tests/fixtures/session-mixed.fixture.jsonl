@@ -1,0 +1,5 @@
+{"event":"tool_call_start","timestamp":"2026-03-06T10:00:00Z","session_key":"alpha-001","tool":"shell","call_id":"c-a1","status":"started","level":"info"}
+{"event":"tool_call_start","timestamp":"2026-03-06T10:00:01Z","session_key":"beta-002","tool":"search","call_id":"c-b1","status":"started","level":"info"}
+{"event":"tool_call_result","timestamp":"2026-03-06T10:00:02Z","session_key":"alpha-001","tool":"shell","call_id":"c-a1","status":"ok","level":"info"}
+{"event":"tool_call_result","timestamp":"2026-03-06T10:00:04Z","session_key":"beta-002","tool":"search","call_id":"c-b1","status":"ok","level":"info"}
+{"event":"tool_call_start","timestamp":"2026-03-06T10:00:05Z","session_key":"alpha-001","tool":"http","call_id":"c-a2","status":"started","level":"warn"}

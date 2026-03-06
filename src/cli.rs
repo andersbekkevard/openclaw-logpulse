@@ -35,7 +35,7 @@ impl LevelArg {
 )]
 pub struct Args {
     #[arg(value_name = "LOG_FILE")]
-    pub log_file: PathBuf,
+    pub log_file: Option<PathBuf>,
 
     #[arg(short = 's', long = "session", value_name = "SUBSTRING")]
     pub session: Option<String>,
@@ -43,7 +43,16 @@ pub struct Args {
     #[arg(short = 't', long = "tool", value_name = "NAME")]
     pub tool: Option<String>,
 
-    #[arg(long = "min-level", default_value = "info", value_enum)]
+    #[arg(short = 'a', long = "agent", value_name = "SUBSTRING")]
+    pub agent: Option<String>,
+
+    #[arg(long = "since", value_name = "TIMESTAMP")]
+    pub since: Option<String>,
+
+    #[arg(long = "until", value_name = "TIMESTAMP")]
+    pub until: Option<String>,
+
+    #[arg(long = "min-level", default_value = "trace", value_enum)]
     min_level: LevelArg,
 
     #[arg(long = "format", default_value = "human", value_enum)]

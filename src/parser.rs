@@ -7,11 +7,11 @@ pub enum ParsedLine {
 }
 
 pub fn parse_line(line: &str) -> ParsedLine {
-    let trimmed = line.trim_end_matches(&['\n', '\r'][..]);
+    let trimmed = line.trim_end_matches(&['\n', '\r'][..]).trim();
     if trimmed.is_empty() {
         return ParsedLine::Malformed {
             raw_line: line.to_string(),
-            reason: "empty line".to_string(),
+            reason: "empty or whitespace line".to_string(),
         };
     }
 

@@ -1,4 +1,5 @@
 mod cli;
+mod discovery;
 mod event;
 mod normalizer;
 mod output;
@@ -8,17 +9,79 @@ mod tailer;
 
 use chrono::Utc;
 use clap::Parser;
+use std::env;
 use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::cli::Args;
 use crate::normalizer::normalize;
 use crate::stale::StaleTracker;
 
+const MISSING_TTL_SECONDS: u64 = 30;
+
 fn main() {
-    let args = Args::parse();
+    let (args, auto_discover) = parse_args();
+
+    let mut tracker = StaleTracker::new(args.stale_seconds);
+    let mut stdout = BufWriter::new(io::stdout());
+    let mut stderr = BufWriter::new(io::stderr());
+    let heartbeat_interval = args.heartbeat_duration();
+    let mut last_heartbeat = Instant::now();
+
+    if auto_discover {
+        let mut discovered_paths = discover_initial_session_logs();
+        let mut tailer = tailer::MultiTailer::new(
+            discovered_paths,
+            !args.no_follow,
+            args.from_start,
+            args.poll_duration(),
+            std::time::Duration::from_secs(MISSING_TTL_SECONDS),
+        );
+        let mut last_scan = Instant::now();
+
+        loop {
+            let now = Instant::now();
+
+            if now.duration_since(last_heartbeat) >= heartbeat_interval {
+                let summary = tracker.heartbeat(Utc::now());
+                if let Err(err) = output::emit_heartbeat(&summary, args.format, &mut stdout) {
+                    let _ = writeln!(stderr, "{}", err);
+                }
+                if let Err(err) = stdout.flush() {
+                    let _ = writeln!(stderr, "{}", err);
+                }
+                last_heartbeat = now;
+            }
+
+            if !args.no_follow && now.duration_since(last_scan) >= tailer.poll_interval() {
+                discovered_paths = discover_initial_session_logs();
+                tailer.sync(discovered_paths);
+                last_scan = now;
+            }
+
+            match tailer.next_line() {
+                Ok(Some((_path, raw_line))) => {
+                    process_raw_line(&raw_line, &args, &mut tracker, &mut stdout, &mut stderr);
+                }
+                Ok(None) => {
+                    if args.no_follow && tailer.is_done() {
+                        break;
+                    }
+                    std::thread::sleep(tailer.poll_interval());
+                }
+                Err(err) => {
+                    let _ = writeln!(stderr, "{}", err);
+                    std::thread::sleep(tailer.poll_interval());
+                }
+            }
+        }
+
+        return;
+    }
+
     let mut tailer = match tailer::Tailer::new(
-        args.log_file.clone(),
+        args.log_file.clone().expect("missing log file argument"),
         !args.no_follow,
         args.from_start,
         args.poll_duration(),
@@ -27,18 +90,15 @@ fn main() {
         Err(err) => {
             eprintln!(
                 "failed to open log file {}: {}",
-                args.log_file.display(),
+                args.log_file
+                    .as_ref()
+                    .expect("missing log file argument")
+                    .display(),
                 err
             );
             return;
         }
     };
-
-    let mut tracker = StaleTracker::new(args.stale_seconds);
-    let mut stdout = BufWriter::new(io::stdout());
-    let mut stderr = BufWriter::new(io::stderr());
-    let heartbeat_interval = args.heartbeat_duration();
-    let mut last_heartbeat = Instant::now();
 
     loop {
         let now = Instant::now();
@@ -55,30 +115,7 @@ fn main() {
 
         match tailer.next_line() {
             Ok(Some(raw_line)) => {
-                let event = normalize(&raw_line);
-                let now = Utc::now();
-                let notices = tracker.on_event(&event, now);
-
-                if event.should_filter(
-                    args.session.as_ref(),
-                    args.tool.as_ref(),
-                    args.min_severity(),
-                ) {
-                    if let Err(err) = output::emit_tool_event(&event, args.format, &mut stdout) {
-                        let _ = writeln!(stderr, "{}", err);
-                    }
-                }
-
-                for warning in notices {
-                    if let Err(err) = output::emit_stale_warning(&warning, args.format, &mut stdout)
-                    {
-                        let _ = writeln!(stderr, "{}", err);
-                    }
-                }
-
-                if let Err(err) = stdout.flush() {
-                    let _ = writeln!(stderr, "{}", err);
-                }
+                process_raw_line(&raw_line, &args, &mut tracker, &mut stdout, &mut stderr);
             }
             Ok(None) => {
                 if args.no_follow {
@@ -92,4 +129,57 @@ fn main() {
             }
         }
     }
+}
+
+fn process_raw_line(
+    raw_line: &str,
+    args: &Args,
+    tracker: &mut StaleTracker,
+    stdout: &mut BufWriter<impl Write>,
+    stderr: &mut BufWriter<impl Write>,
+) {
+    let event = normalize(raw_line);
+    let now = Utc::now();
+    let notices = tracker.on_event(&event, now);
+
+    if event.should_filter(
+        args.session.as_ref(),
+        args.tool.as_ref(),
+        args.min_severity(),
+    ) {
+        if let Err(err) = output::emit_tool_event(&event, args.format, stdout) {
+            let _ = writeln!(stderr, "{}", err);
+        }
+    }
+
+    for warning in notices {
+        if let Err(err) = output::emit_stale_warning(&warning, args.format, stdout) {
+            let _ = writeln!(stderr, "{}", err);
+        }
+    }
+
+    if let Err(err) = stdout.flush() {
+        let _ = writeln!(stderr, "{}", err);
+    }
+}
+
+fn discover_initial_session_logs() -> Vec<PathBuf> {
+    let home_dir = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+
+    match home_dir {
+        Some(home) => {
+            let root = home.join(".openclaw");
+            discovery::discover_session_logs(&root).unwrap_or_else(|_| Vec::new())
+        }
+        None => Vec::new(),
+    }
+}
+
+fn parse_args() -> (Args, bool) {
+    let args = Args::parse_from(env::args_os());
+    let use_discovery = args.log_file.is_none();
+
+    (args, use_discovery)
 }
