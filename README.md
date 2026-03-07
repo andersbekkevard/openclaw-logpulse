@@ -1,6 +1,6 @@
 # openclaw-logpulse
 
-openclaw-logpulse gives you a fast CLI for live OpenClaw log observation focused on tool-call lifecycle visibility.
+openclaw-logpulse gives you a fast CLI for live OpenClaw log observation focused on tool-call lifecycle visibility. On an interactive terminal it opens a colored TUI by default; when stdout is piped it falls back to one-line human output.
 
 ## Install
 
@@ -12,8 +12,11 @@ cargo install --path /home/anders/.openclaw/workspace/dev/openclaw-logpulse
 ## Usage
 
 ```bash
-# One-line default usage (auto-discovers the OpenClaw log file)
+# Default usage opens the TUI and auto-discovers session logs
 openclaw-logpulse
+
+# Force one-line human output
+openclaw-logpulse --format human
 
 # Follow from beginning of discovered source
 openclaw-logpulse --from-start
@@ -42,7 +45,7 @@ openclaw-logpulse --no-follow
 - `--tool <NAME>` filter by tool substring (case-insensitive).
 - `--agent <SUBSTRING>` filter by agent id substring (case-insensitive).
 - `--min-level <trace|debug|info|warn|error|fatal>` minimum level filter.
-- `--format <human|json>` output format.
+- `--format <tui|human|json>` output format. `tui` is the default and automatically falls back to `human` when stdout is not a terminal.
 - `--since <TIMESTAMP>` emit events at or after this time (`RFC3339` or unix seconds).
 - `--until <TIMESTAMP>` emit events at or before this time (`RFC3339` or unix seconds).
 - `--stale-seconds N` threshold for stale in-flight calls.

@@ -55,7 +55,7 @@ pub struct Args {
     #[arg(long = "min-level", default_value = "trace", value_enum)]
     min_level: LevelArg,
 
-    #[arg(long = "format", default_value = "human", value_enum)]
+    #[arg(long = "format", default_value = "tui", value_enum)]
     pub format: OutputMode,
 
     #[arg(long = "stale-seconds", default_value_t = 30)]

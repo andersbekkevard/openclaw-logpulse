@@ -3,12 +3,22 @@ use crate::stale::{HeartbeatSummary, StaleWarning};
 use chrono::Utc;
 use clap::ValueEnum;
 use serde::Serialize;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 pub enum OutputMode {
+    Tui,
     Human,
     Json,
+}
+
+impl OutputMode {
+    pub fn effective(self) -> Self {
+        match self {
+            OutputMode::Tui if !io::stdout().is_terminal() => OutputMode::Human,
+            mode => mode,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -37,6 +47,7 @@ pub fn emit_tool_event(
     out: &mut impl Write,
 ) -> io::Result<()> {
     match mode {
+        OutputMode::Tui => emit_tool_event(event, OutputMode::Human, out),
         OutputMode::Json => {
             let record = OutputRecord::ToolEvent { event };
             writeln!(
@@ -86,6 +97,7 @@ pub fn emit_stale_warning(
     out: &mut impl Write,
 ) -> io::Result<()> {
     match mode {
+        OutputMode::Tui => emit_stale_warning(warning, OutputMode::Human, out),
         OutputMode::Json => {
             let record = OutputRecord::StaleWarning {
                 call_id: &warning.call_id,
@@ -119,6 +131,7 @@ pub fn emit_heartbeat(
     out: &mut impl Write,
 ) -> io::Result<()> {
     match mode {
+        OutputMode::Tui => emit_heartbeat(summary, OutputMode::Human, out),
         OutputMode::Json => {
             let record = OutputRecord::Heartbeat {
                 active_calls: summary.active_calls,
