@@ -10,6 +10,7 @@ pub struct InFlightCall {
     pub tool_name: Option<String>,
     pub started_at: DateTime<Utc>,
     pub message: Option<String>,
+    pub args_preview: Vec<(String, String)>,
     pub warned: bool,
 }
 
@@ -108,7 +109,17 @@ impl StaleTracker {
             session_id: event.session_id.clone(),
             tool_name: event.tool_name.clone(),
             started_at: event.timestamp.unwrap_or(now),
-            message: event.message.clone(),
+            message: event
+                .message
+                .clone()
+                .or_else(|| event.result_preview.clone())
+                .or_else(|| {
+                    event
+                        .preferred_params()
+                        .first()
+                        .map(|(key, value)| format!("{key}={value}"))
+                }),
+            args_preview: event.preferred_params().to_vec(),
             warned: false,
         };
 
@@ -185,7 +196,11 @@ impl StaleTracker {
                     session_key: call.session_key.clone(),
                     tool_name: call.tool_name.clone(),
                     age_seconds,
-                    message: call.message.clone(),
+                    message: call.message.clone().or_else(|| {
+                        call.args_preview
+                            .first()
+                            .map(|(key, value)| format!("{key}={value}"))
+                    }),
                 });
             }
         }
@@ -224,17 +239,29 @@ mod tests {
             tool_name: Some("shell".to_string()),
             status: None,
             result_summary: None,
+            result_preview: None,
+            result_raw: None,
+            result_metrics: Vec::new(),
+            exit_code: None,
+            duration_ms: None,
+            is_error: None,
             call_id: call_ids.first().map(|value| (*value).to_string()),
-            correlation_ids: call_ids
-                .iter()
-                .skip(1)
-                .map(|value| (*value).to_string())
-                .collect(),
+            call_ids: call_ids.iter().map(|value| (*value).to_string()).collect(),
+            correlation_ids: call_ids.iter().map(|value| (*value).to_string()).collect(),
+            message_id: None,
+            parent_message_id: None,
             level: Severity::Info,
             level_raw: Some("info".to_string()),
             params: Vec::new(),
+            args_preview: Vec::new(),
+            args_raw: None,
+            args_truncated: false,
             message: None,
             raw_line: String::new(),
+            source_path: None,
+            source_kind: None,
+            session_source: None,
+            agent_source: None,
         }
     }
 
