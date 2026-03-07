@@ -194,23 +194,48 @@ pub fn normalize_with_source(line: &str, source_path: Option<&Path>) -> Normaliz
     match crate::parser::parse_line(line) {
         ParsedLine::Malformed { raw_line, reason } => NormalizedEvent {
             kind: ToolEventKind::Malformed,
-            timestamp: None,
-            timestamp_raw: None,
-            session_key: None,
-            session_id: None,
-            agent_id: None,
-            tool_name: None,
-            status: None,
             result_summary: Some(reason),
-            call_id: None,
-            correlation_ids: Vec::new(),
-            level: Severity::Unknown,
-            level_raw: None,
-            params: Vec::new(),
-            message: None,
-            raw_line,
+            result_preview: None,
+            ..empty_event(raw_line)
         },
         ParsedLine::Json(value) => normalize_json(line, &value, source_path),
+    }
+}
+
+fn empty_event(raw_line: String) -> NormalizedEvent {
+    NormalizedEvent {
+        kind: ToolEventKind::Other,
+        timestamp: None,
+        timestamp_raw: None,
+        source_path: None,
+        source_kind: None,
+        session_key: None,
+        session_id: None,
+        session_source: None,
+        agent_id: None,
+        agent_source: None,
+        tool_name: None,
+        status: None,
+        result_summary: None,
+        result_preview: None,
+        result_raw: None,
+        result_metrics: Vec::new(),
+        exit_code: None,
+        duration_ms: None,
+        is_error: None,
+        call_id: None,
+        call_ids: Vec::new(),
+        correlation_ids: Vec::new(),
+        message_id: None,
+        parent_message_id: None,
+        level: Severity::Unknown,
+        level_raw: None,
+        params: Vec::new(),
+        args_preview: Vec::new(),
+        args_raw: None,
+        args_truncated: false,
+        message: None,
+        raw_line,
     }
 }
 
@@ -218,21 +243,10 @@ fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> Norma
     if value.as_object().is_none() {
         return NormalizedEvent {
             kind: ToolEventKind::Malformed,
-            timestamp: None,
             timestamp_raw: Some(raw.to_string()),
-            session_key: None,
-            session_id: None,
-            agent_id: None,
-            tool_name: None,
-            status: None,
             result_summary: Some("non-object json entry".to_string()),
-            call_id: None,
-            correlation_ids: Vec::new(),
-            level: Severity::Unknown,
-            level_raw: None,
-            params: Vec::new(),
             message: Some(raw.to_string()),
-            raw_line: raw.to_string(),
+            ..empty_event(raw.to_string())
         };
     }
 
@@ -269,17 +283,36 @@ fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> Norma
         kind,
         timestamp,
         timestamp_raw,
+        source_path: source_path.map(|path| path.display().to_string()),
+        source_kind: source_path.map(|_| "session_log".to_string()),
         session_key,
         session_id,
+        session_source: source_context
+            .session_id
+            .as_ref()
+            .map(|_| "path".to_string()),
         agent_id,
+        agent_source: source_context.agent_id.as_ref().map(|_| "path".to_string()),
         tool_name,
         status,
-        result_summary,
+        result_summary: result_summary.clone(),
+        result_preview: result_summary,
+        result_raw: None,
+        result_metrics: Vec::new(),
+        exit_code: None,
+        duration_ms: None,
+        is_error: None,
         call_id,
+        call_ids: correlation_ids.clone(),
         correlation_ids,
+        message_id: None,
+        parent_message_id: None,
         level,
         level_raw,
-        params,
+        params: params.clone(),
+        args_preview: params,
+        args_raw: None,
+        args_truncated: false,
         message,
         raw_line: raw.to_string(),
     }
@@ -352,19 +385,14 @@ fn normalize_transcript_event(
             kind: ToolEventKind::Other,
             timestamp,
             timestamp_raw,
-            session_key: None,
             session_id,
             agent_id,
-            tool_name: None,
-            status: None,
             result_summary: Some("session started".to_string()),
-            call_id: None,
-            correlation_ids: Vec::new(),
             level: Severity::Info,
             level_raw: Some("info".to_string()),
-            params: Vec::new(),
             message: Some("session started".to_string()),
-            raw_line: raw.to_string(),
+            source_kind: Some("transcript_v3".to_string()),
+            ..empty_event(raw.to_string())
         }),
         "message" => {
             normalize_transcript_message(raw, value, timestamp, timestamp_raw, session_id, agent_id)
@@ -403,7 +431,6 @@ fn normalize_transcript_message(
             kind: ToolEventKind::ToolCallResult,
             timestamp,
             timestamp_raw,
-            session_key: None,
             session_id,
             agent_id,
             tool_name: first_string_from_paths(message, &[&["toolName"]]),
@@ -416,14 +443,20 @@ fn normalize_transcript_message(
             result_summary: first_text_content(&content)
                 .or_else(|| first_string_from_paths(message, &[&["details", "aggregated"]]))
                 .or_else(|| first_string_from_paths(message, &[&["details", "status"]])),
+            result_preview: first_text_content(&content)
+                .or_else(|| first_string_from_paths(message, &[&["details", "aggregated"]]))
+                .or_else(|| first_string_from_paths(message, &[&["details", "status"]])),
             call_id: first_string_from_paths(message, &[&["toolCallId"]]),
+            call_ids: first_string_from_paths(message, &[&["toolCallId"]]).into_iter().collect(),
             correlation_ids: Vec::new(),
             level,
             level_raw,
             params: extract_transcript_result_params(message),
+            args_preview: extract_transcript_result_params(message),
+            source_kind: Some("transcript_v3".to_string()),
             message: first_string_from_paths(message, &[&["details", "aggregated"]])
                 .or_else(|| first_text_content(&content)),
-            raw_line: raw.to_string(),
+            ..empty_event(raw.to_string())
         });
     }
 
@@ -444,13 +477,12 @@ fn normalize_transcript_message(
             kind: ToolEventKind::ToolCallStart,
             timestamp,
             timestamp_raw,
-            session_key: None,
             session_id,
             agent_id,
             tool_name: first_string_from_paths(first_tool_call, &[&["name"]]),
             status: Some("started".to_string()),
-            result_summary: None,
             call_id: first_string_from_paths(first_tool_call, &[&["id"]]),
+            call_ids: first_string_from_paths(first_tool_call, &[&["id"]]).into_iter().collect(),
             correlation_ids,
             level: Severity::Info,
             level_raw: Some("info".to_string()),
@@ -458,9 +490,14 @@ fn normalize_transcript_message(
                 .get("arguments")
                 .map(extract_params_from_value)
                 .unwrap_or_default(),
+            args_preview: first_tool_call
+                .get("arguments")
+                .map(extract_params_from_value)
+                .unwrap_or_default(),
+            source_kind: Some("transcript_v3".to_string()),
             message: first_string_from_paths(message, &[&["stopReason"]])
                 .or_else(|| first_text_content(&content)),
-            raw_line: raw.to_string(),
+            ..empty_event(raw.to_string())
         });
     }
 
@@ -468,10 +505,8 @@ fn normalize_transcript_message(
         kind: ToolEventKind::Other,
         timestamp,
         timestamp_raw,
-        session_key: None,
         session_id,
         agent_id,
-        tool_name: None,
         status: first_string_from_paths(message, &[&["stopReason"]]).or_else(|| {
             if role.is_empty() {
                 None
@@ -479,14 +514,11 @@ fn normalize_transcript_message(
                 Some(role.to_string())
             }
         }),
-        result_summary: None,
-        call_id: None,
-        correlation_ids: Vec::new(),
         level: Severity::Info,
         level_raw: Some("info".to_string()),
-        params: Vec::new(),
+        source_kind: Some("transcript_v3".to_string()),
         message: None,
-        raw_line: raw.to_string(),
+        ..empty_event(raw.to_string())
     })
 }
 
