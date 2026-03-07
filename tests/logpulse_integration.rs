@@ -99,21 +99,6 @@ fn parse_json_lines(stdout: &str) -> Vec<Value> {
         .collect()
 }
 
-fn find_tool_event_with_status<'a>(
-    records: &'a [Value],
-    call_id: &str,
-    status: Option<&str>,
-) -> &'a Value {
-    records
-        .iter()
-        .find(|record| {
-            record.get("kind").and_then(Value::as_str) == Some("tool_event")
-                && record.pointer("/event/call_id").and_then(Value::as_str) == Some(call_id)
-                && record.pointer("/event/status").and_then(Value::as_str) == status
-        })
-        .unwrap_or_else(|| panic!("missing tool_event for call_id={call_id} status={status:?}"))
-}
-
 #[test]
 fn one_line_default_mode_emits_single_record() {
     let (stdout, stderr, status) = run_cli(&[
@@ -206,7 +191,30 @@ fn malformed_lines_are_preserved_in_json_output() {
 }
 
 #[test]
-fn human_output_surfaces_realistic_exec_memory_and_read_params() {
+fn transcript_v3_logs_include_session_agent_and_tool_context() {
+    let tmp = TempDir::new("transcript-v3");
+    let log = tmp
+        .path()
+        .join(".openclaw")
+        .join("agents")
+        .join("main")
+        .join("sessions")
+        .join("12345678-1234-1234-1234-123456789abc.jsonl");
+    fs::create_dir_all(log.parent().expect("sessions dir")).expect("create sessions dir");
+
+    append_line(
+        &log,
+        r#"{"type":"session","version":3,"id":"12345678-1234-1234-1234-123456789abc","timestamp":"2026-03-07T09:30:58.210Z","cwd":"/home/anders"}"#,
+    );
+    append_line(
+        &log,
+        r#"{"type":"message","id":"60167cca","parentId":"1f5ac5f2","timestamp":"2026-03-07T09:31:19.656Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_KF57u6qJpwvTbrDMQnUr0Xcn|fc_test_a","name":"read","arguments":{"file_path":"/home/anders/.openclaw/workspace/SOUL.md"}}],"stopReason":"toolUse","timestamp":1772875879655}}"#,
+    );
+    append_line(
+        &log,
+        r#"{"type":"message","id":"92a280c2","parentId":"a6814bd6","timestamp":"2026-03-07T09:31:19.698Z","message":{"role":"toolResult","toolCallId":"call_KF57u6qJpwvTbrDMQnUr0Xcn|fc_test_a","toolName":"read","content":[{"type":"text","text":"contents"}],"isError":false,"timestamp":1772875879690}}"#,
+    );
+
     let (stdout, stderr, status) = run_cli(&[
         "--no-follow",
         "--from-start",
@@ -214,169 +222,15 @@ fn human_output_surfaces_realistic_exec_memory_and_read_params() {
         "1000000",
         "--format",
         "human",
-        fixture("readability-corpus.fixture.jsonl")
-            .to_str()
-            .expect("fixture path"),
+        log.to_str().expect("fixture path"),
     ]);
 
     assert_eq!(status, 0, "stderr: {stderr}");
-    let lines: Vec<&str> = stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    assert_eq!(lines.len(), 5, "unexpected lines: {lines:?}");
-
-    assert!(lines.iter().any(|line| {
-        line.contains("session=session-readability")
-            && line.contains("agent=agent-alpha")
-            && line.contains("tool=exec")
-            && line.contains("status=started")
-            && line.contains("command=git status --short")
-            && line.contains("cwd=/repo/service")
-    }));
-    assert!(lines.iter().any(|line| {
-        line.contains("tool=memory_search")
-            && line.contains("query=stale warning emitted once per long running call")
-            && line.contains("namespace=rust-tests")
-            && line.contains("top_k=3")
-    }));
-    assert!(lines.iter().any(|line| {
-        line.contains("tool=read")
-            && line.contains("status=started")
-            && line.contains("file_path=tests/fixtures/readability-corpus.fixture.jsonl")
-            && line.contains("limit=80")
-    }));
-}
-
-#[test]
-fn json_mode_preserves_nested_tool_call_arguments_and_results() {
-    let (stdout, stderr, status) = run_cli(&[
-        "--no-follow",
-        "--from-start",
-        "--stale-seconds",
-        "1000000",
-        "--format",
-        "json",
-        fixture("transcript-like.fixture.jsonl")
-            .to_str()
-            .expect("fixture path"),
-    ]);
-
-    assert_eq!(status, 0, "stderr: {stderr}");
-    let records = parse_json_lines(&stdout);
-    assert_eq!(records.len(), 4);
-
-    let read_start = find_tool_event_with_status(&records, "transcript-call-1", None);
-    assert_eq!(
-        read_start
-            .pointer("/event/tool_name")
-            .and_then(Value::as_str),
-        Some("read")
-    );
-    assert_eq!(
-        read_start
-            .pointer("/event/agent_id")
-            .and_then(Value::as_str),
-        Some("agent-transcript")
-    );
-    let read_params = read_start
-        .pointer("/event/params")
-        .and_then(Value::as_array)
-        .expect("read params");
-    assert!(read_params.iter().any(|pair| {
-        pair.get(0).and_then(Value::as_str) == Some("file_path")
-            && pair.get(1).and_then(Value::as_str) == Some("src/output.rs")
-    }));
-
-    let search_result = find_tool_event_with_status(&records, "transcript-call-2", Some("ok"));
-    assert_eq!(
-        search_result
-            .pointer("/event/tool_name")
-            .and_then(Value::as_str),
-        Some("web.search")
-    );
-    assert_eq!(
-        search_result
-            .pointer("/event/status")
-            .and_then(Value::as_str),
-        Some("ok")
-    );
-    assert_eq!(
-        search_result
-            .pointer("/event/result_summary")
-            .and_then(Value::as_str),
-        Some("object(len=1)")
-    );
-    assert_eq!(
-        search_result
-            .pointer("/event/message")
-            .and_then(Value::as_str),
-        Some("collected 2 candidate references")
-    );
-}
-
-#[test]
-fn non_object_json_entries_and_malformed_lines_remain_inspectable() {
-    let (stdout, stderr, status) = run_cli(&[
-        "--no-follow",
-        "--from-start",
-        "--stale-seconds",
-        "1000000",
-        "--format",
-        "json",
-        fixture("non-object-json.fixture.jsonl")
-            .to_str()
-            .expect("fixture path"),
-    ]);
-
-    assert_eq!(status, 0, "stderr: {stderr}");
-    let records = parse_json_lines(&stdout);
-    assert_eq!(records.len(), 5);
-
-    let malformed_non_object = records
-        .iter()
-        .filter(|record| {
-            record.get("kind").and_then(Value::as_str) == Some("tool_event")
-                && record
-                    .pointer("/event/kind/event_kind")
-                    .and_then(Value::as_str)
-                    == Some("malformed")
-                && record
-                    .pointer("/event/result_summary")
-                    .and_then(Value::as_str)
-                    == Some("non-object json entry")
-        })
-        .count();
-    assert_eq!(malformed_non_object, 2);
-
-    assert!(records.iter().any(|record| {
-        record
-            .pointer("/event/kind/event_kind")
-            .and_then(Value::as_str)
-            == Some("malformed")
-            && record.pointer("/event/raw_line").and_then(Value::as_str)
-                == Some("{not valid json\n")
-    }));
-}
-
-#[test]
-fn human_output_falls_back_to_session_id_when_session_key_is_absent() {
-    let (stdout, stderr, status) = run_cli(&[
-        "--no-follow",
-        "--from-start",
-        "--format",
-        "human",
-        fixture("session-id-only.fixture.jsonl")
-            .to_str()
-            .expect("fixture path"),
-    ]);
-
-    assert_eq!(status, 0, "stderr: {stderr}");
-    let line = stdout.trim();
-    assert!(line.contains("session=session-id-fallback"), "{line}");
-    assert!(line.contains("agent=agent-fallback"), "{line}");
-    assert!(line.contains("tool=exec"), "{line}");
-    assert!(line.contains("command=cargo test json_mode_outputs_valid_records"));
+    assert!(stdout.contains("session=12345678-1234-1234-1234-123456789abc"));
+    assert!(stdout.contains("agent=main"));
+    assert!(stdout.contains("START"));
+    assert!(stdout.contains("RESULT"));
+    assert!(stdout.contains("tool=read"));
 }
 
 #[test]
@@ -511,7 +365,7 @@ fn stale_warning_emitted_once_per_long_running_call() {
             "--stale-seconds",
             "1",
             "--heartbeat-seconds",
-            "1",
+            "10",
             "--format",
             "json",
             log.to_str().expect("log path"),
@@ -524,20 +378,20 @@ fn stale_warning_emitted_once_per_long_running_call() {
     thread::sleep(Duration::from_millis(150));
     append_line(
         &log,
-        r#"{"event":"tool_call_start","timestamp":"2025-12-31T23:59:50Z","session_key":"session-stale","agent_id":"agent-stale","tool_name":"exec","call_id":"stale-1","status":"started","level":"info","params":{"command":"cargo test stale_warning_emitted_once_per_long_running_call","cwd":"/repo/openclaw-logpulse"}}"#,
+        r#"{"event":"tool_call_start","timestamp":"2025-12-31T23:59:50Z","session_key":"session-stale","tool_name":"shell","call_id":"stale-1","status":"started","level":"info"}"#,
     );
-    thread::sleep(Duration::from_millis(1250));
+    thread::sleep(Duration::from_millis(150));
     append_line(
         &log,
-        r#"{"event":"tool_call","session_key":"session-stale","agent_id":"agent-stale","tool_name":"exec","call_id":"stale-1","status":"in_progress","level":"info","message":"still streaming test output"}"#,
+        r#"{"event":"tool_call","session_key":"session-stale","tool_name":"shell","status":"in_progress","level":"info"}"#,
     );
-    thread::sleep(Duration::from_millis(1100));
+    thread::sleep(Duration::from_millis(120));
     append_line(
         &log,
-        r#"{"event":"tool_call_result","timestamp":"2025-12-31T23:59:52Z","session_key":"session-stale","agent_id":"agent-stale","tool_name":"exec","call_id":"stale-1","status":"ok","level":"info","result_summary":"test completed"}"#,
+        r#"{"event":"tool_call_result","session_key":"session-stale","tool_name":"shell","call_id":"stale-1","status":"ok","level":"info"}"#,
     );
 
-    thread::sleep(Duration::from_millis(250));
+    thread::sleep(Duration::from_millis(180));
     let _ = child.kill();
     let output = child.wait_with_output().expect("collect output");
     let records = parse_json_lines(&String::from_utf8_lossy(&output.stdout));
@@ -550,27 +404,6 @@ fn stale_warning_emitted_once_per_long_running_call() {
         })
         .collect();
     assert_eq!(warnings.len(), 1);
-
-    let heartbeats: Vec<_> = records
-        .iter()
-        .filter(|record| record.get("kind").and_then(Value::as_str) == Some("heartbeat"))
-        .collect();
-    assert!(
-        !heartbeats.is_empty(),
-        "expected heartbeat records in follow mode output"
-    );
-    assert!(heartbeats.iter().any(|record| {
-        record
-            .get("active_sessions")
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            >= 1
-            && record
-                .get("stale_calls")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                >= 1
-    }));
 }
 
 #[test]

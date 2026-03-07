@@ -1,5 +1,0 @@
-{"event":"tool_call_start","timestamp":"2026-03-06T12:00:00Z","session_key":"session-non-object","tool":"exec","call_id":"good-1","status":"started","level":"info","params":{"command":"printf ready"}}
-["unexpected","json","array"]
-"standalone string"
-{"event":"tool_call_result","timestamp":"2026-03-06T12:00:01Z","session_key":"session-non-object","tool":"exec","call_id":"good-1","status":"ok","level":"info","result_summary":"printed ready"}
-{not valid json

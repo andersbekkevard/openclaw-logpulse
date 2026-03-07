@@ -94,6 +94,7 @@ impl NormalizedEvent {
     pub fn should_filter(
         &self,
         session_substring: Option<&String>,
+        agent_substring: Option<&String>,
         tool_name: Option<&String>,
         min_level: Severity,
     ) -> bool {
@@ -110,6 +111,18 @@ impl NormalizedEvent {
                 .map(|value| value.to_ascii_lowercase().contains(&needle))
                 .unwrap_or(false);
             if !session_matches {
+                return false;
+            }
+        }
+
+        if let Some(agent_filter) = agent_substring {
+            let needle = agent_filter.to_ascii_lowercase();
+            if self
+                .agent_id
+                .as_ref()
+                .map(|value| !value.to_ascii_lowercase().contains(&needle))
+                .unwrap_or(true)
+            {
                 return false;
             }
         }

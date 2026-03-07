@@ -5,11 +5,20 @@ use clap::ValueEnum;
 use serde::Serialize;
 use std::io::{self, IsTerminal, Write};
 
-#[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ValueEnum)]
 pub enum OutputMode {
     Tui,
     Human,
     Json,
+    Tui,
+}
+
+pub fn effective_mode(mode: OutputMode) -> OutputMode {
+    if mode == OutputMode::Tui && !io::stdout().is_terminal() {
+        OutputMode::Human
+    } else {
+        mode
+    }
 }
 
 impl OutputMode {
@@ -88,6 +97,7 @@ pub fn emit_tool_event(
                 event.kind.as_str(),
             )
         }
+        OutputMode::Tui => Ok(()),
     }
 }
 
@@ -122,6 +132,7 @@ pub fn emit_stale_warning(
                 warning.call_id, session, tool, warning.age_seconds
             )
         }
+        OutputMode::Tui => Ok(()),
     }
 }
 
@@ -145,6 +156,7 @@ pub fn emit_heartbeat(
             )
         }
         OutputMode::Human => writeln!(out, "[HB] {}", summary.to_line()),
+        OutputMode::Tui => Ok(()),
     }
 }
 

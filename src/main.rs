@@ -12,24 +12,24 @@ use chrono::Utc;
 use clap::Parser;
 use std::env;
 use std::io::{self, BufWriter, Write};
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::cli::Args;
-use crate::event::NormalizedEvent;
-use crate::normalizer::normalize;
-use crate::output::OutputMode;
+use crate::normalizer::normalize_with_source;
+use crate::output::{effective_mode, OutputMode};
 use crate::stale::StaleTracker;
 
 const MISSING_TTL_SECONDS: u64 = 30;
 
 fn main() {
-    let (args, auto_discover) = parse_args();
-    let mode = args.format.effective();
+    let (mut args, auto_discover) = parse_args();
+    args.format = effective_mode(args.format);
 
-    if matches!(mode, OutputMode::Tui) {
+    if args.format == OutputMode::Tui {
         if let Err(err) = tui::run(&args) {
-            eprintln!("failed to start TUI: {err}");
+            eprintln!("failed to start TUI: {}", err);
         }
         return;
     }
@@ -56,7 +56,7 @@ fn main() {
 
             if now.duration_since(last_heartbeat) >= heartbeat_interval {
                 let summary = tracker.heartbeat(Utc::now());
-                if let Err(err) = output::emit_heartbeat(&summary, mode, &mut stdout) {
+                if let Err(err) = output::emit_heartbeat(&summary, args.format, &mut stdout) {
                     let _ = writeln!(stderr, "{}", err);
                 }
                 if let Err(err) = stdout.flush() {
@@ -72,11 +72,11 @@ fn main() {
             }
 
             match tailer.next_line() {
-                Ok(Some((_path, raw_line))) => {
+                Ok(Some((path, raw_line))) => {
                     process_raw_line(
                         &raw_line,
+                        Some(path.as_path()),
                         &args,
-                        mode,
                         &mut tracker,
                         &mut stdout,
                         &mut stderr,
@@ -122,7 +122,7 @@ fn main() {
         let now = Instant::now();
         if now.duration_since(last_heartbeat) >= heartbeat_interval {
             let summary = tracker.heartbeat(Utc::now());
-            if let Err(err) = output::emit_heartbeat(&summary, mode, &mut stdout) {
+            if let Err(err) = output::emit_heartbeat(&summary, args.format, &mut stdout) {
                 let _ = writeln!(stderr, "{}", err);
             }
             if let Err(err) = stdout.flush() {
@@ -135,8 +135,8 @@ fn main() {
             Ok(Some(raw_line)) => {
                 process_raw_line(
                     &raw_line,
+                    args.log_file.as_deref(),
                     &args,
-                    mode,
                     &mut tracker,
                     &mut stdout,
                     &mut stderr,
@@ -158,27 +158,30 @@ fn main() {
 
 fn process_raw_line(
     raw_line: &str,
+    source_path: Option<&Path>,
     args: &Args,
-    mode: OutputMode,
     tracker: &mut StaleTracker,
     stdout: &mut BufWriter<impl Write>,
     stderr: &mut BufWriter<impl Write>,
 ) {
-    let event = normalize(raw_line);
+    let event = normalize_with_source(raw_line, source_path);
     let now = Utc::now();
     let notices = tracker.on_event(&event, now);
 
-    if event_matches_filters(&event, args) {
-        if let Err(err) = output::emit_tool_event(&event, mode, stdout) {
+    if event.should_filter(
+        args.session.as_ref(),
+        args.agent.as_ref(),
+        args.tool.as_ref(),
+        args.min_severity(),
+    ) {
+        if let Err(err) = output::emit_tool_event(&event, args.format, stdout) {
             let _ = writeln!(stderr, "{}", err);
         }
     }
 
     for warning in notices {
-        if stale_warning_matches_filters(&warning, args) {
-            if let Err(err) = output::emit_stale_warning(&warning, mode, stdout) {
-                let _ = writeln!(stderr, "{}", err);
-            }
+        if let Err(err) = output::emit_stale_warning(&warning, args.format, stdout) {
+            let _ = writeln!(stderr, "{}", err);
         }
     }
 
@@ -187,66 +190,7 @@ fn process_raw_line(
     }
 }
 
-pub(crate) fn event_matches_filters(event: &NormalizedEvent, args: &Args) -> bool {
-    if !event.should_filter(
-        args.session.as_ref(),
-        args.tool.as_ref(),
-        args.min_severity(),
-    ) {
-        return false;
-    }
-
-    if let Some(agent_filter) = args.agent.as_ref() {
-        let needle = agent_filter.to_ascii_lowercase();
-        let agent_matches = event
-            .agent_id
-            .as_ref()
-            .map(|value| value.to_ascii_lowercase().contains(&needle))
-            .unwrap_or(false);
-        if !agent_matches {
-            return false;
-        }
-    }
-
-    true
-}
-
-pub(crate) fn stale_warning_matches_filters(
-    warning: &crate::stale::StaleWarning,
-    args: &Args,
-) -> bool {
-    if let Some(session_filter) = args.session.as_ref() {
-        let needle = session_filter.to_ascii_lowercase();
-        let session_matches = warning
-            .session_key
-            .as_ref()
-            .map(|value| value.to_ascii_lowercase().contains(&needle))
-            .unwrap_or(false);
-        if !session_matches {
-            return false;
-        }
-    }
-
-    if let Some(tool_filter) = args.tool.as_ref() {
-        let needle = tool_filter.to_ascii_lowercase();
-        let tool_matches = warning
-            .tool_name
-            .as_ref()
-            .map(|value| value.to_ascii_lowercase().contains(&needle))
-            .unwrap_or(false);
-        if !tool_matches {
-            return false;
-        }
-    }
-
-    if args.agent.is_some() {
-        return false;
-    }
-
-    true
-}
-
-pub(crate) fn discover_initial_session_logs() -> Vec<PathBuf> {
+fn discover_initial_session_logs() -> Vec<PathBuf> {
     let home_dir = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from);

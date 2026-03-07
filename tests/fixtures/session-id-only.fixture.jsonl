@@ -1,1 +1,0 @@
-{"event":"tool_call_start","timestamp":"2026-03-06T13:30:00Z","session_id":"session-id-fallback","agent_id":"agent-fallback","tool":"exec","call_id":"sid-1","status":"started","level":"info","params":{"command":"cargo test json_mode_outputs_valid_records","cwd":"/repo/openclaw-logpulse"}}

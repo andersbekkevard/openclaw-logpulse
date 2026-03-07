@@ -23,7 +23,7 @@ pub struct StaleTracker {
     synthetic_id_seq: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StaleWarning {
     pub call_id: String,
     pub session_key: Option<String>,
@@ -32,7 +32,7 @@ pub struct StaleWarning {
     pub message: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HeartbeatSummary {
     pub active_calls: usize,
     pub stale_calls: usize,
