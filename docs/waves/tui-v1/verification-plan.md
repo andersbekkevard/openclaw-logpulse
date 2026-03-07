@@ -36,7 +36,12 @@ Implementation may organize modules differently, but the verification plan assum
 
 - a derived store/index layer for normalized events, correlated calls, and session summaries
 - a route/state reducer for tabs, drilldown, overlays, and follow/pin behavior
+- a machine-readable keymap/action table shared by input dispatch and contextual help generation
 - a rendering surface that can render ratatui buffers off-screen for snapshot tests
+
+Required invariant across all seams:
+
+- Any test that renders a selected row, inspector, expanded detail, or drilled dataset must assert stable entity IDs and backing derived entities, not only route state, row counts, or snapshot text.
 
 If implementation keeps all behavior inside [`src/tui.rs`](/home/anders/.openclaw/workspace/dev/openclaw-logpulse-worktrees/w25-verification-plan/src/tui.rs), the same checks still apply, but the tests should target extracted internal helpers instead of only black-box terminal sessions.
 
@@ -68,12 +73,14 @@ Each item below is binding. If implementation changes structure, it must still s
   - Tab order is exactly `Events`, `Correlated Tool Calls`, `Sessions`.
   - `h`/`l` and `1`/`2`/`3` switch tabs correctly.
   - Each tab remembers cursor, scroll offset, follow state, unseen count, and search match index independently.
+  - Pinned selection is anchored to stable entity identity, not current list index.
 - How it runs:
   - State-machine tests feed a fixed event/call/session dataset into app state, simulate key sequences, and assert route plus per-tab state.
+  - Live-update tests prepend new rows ahead of a pinned selection and assert the selected entity ID is unchanged before and after ingest.
   - Snapshot tests render the header/body/footer after tab switches to prove tab labels, status badges, and remembered selection state appear in the buffer.
 - Pass/fail signal:
-  - Pass if state assertions match and snapshots are unchanged.
-  - Fail on any tab order drift, state leakage between tabs, or missing indicator text.
+  - Pass if state assertions, selected entity IDs, and snapshots are unchanged.
+  - Fail on any tab order drift, state leakage between tabs, missing indicator text, or pinned-selection identity drift under prepend churn.
 - Tier:
   - `Tier 1 Autonomous`.
 - Wrong-but-plausible failures this must catch:
@@ -89,12 +96,16 @@ Each item below is binding. If implementation changes structure, it must still s
   - `Events -> Enter` and `o` open expanded detail.
   - `Esc`/`q` unwind one layer and restore previous tab, cursor, scroll, and follow state.
   - Breadcrumb text matches the route contract.
+  - The drilled datasets themselves are correct, including inspector/detail backing entities and absence of out-of-scope derived notices.
 - How it runs:
-  - State-machine tests drive route transitions over a deterministic multi-session fixture with repeated tool names and repeated call IDs across sessions.
+  - State-machine tests drive route transitions over a deterministic multi-session fixture with repeated tool names, repeated call IDs across sessions, and two source files sharing the same `session_key` but different source-path UUIDs.
+  - For `Sessions -> Correlated Tool Calls`, tests assert the exact visible `call_entity_id` set after drilldown.
+  - For `Correlated Tool Calls -> Events`, tests assert the exact visible `event_ref` set after drilldown and the same `event_ref` or entity ID in list row, inspector, and expanded detail.
+  - Negative assertions prove stale warnings and other derived notices from outside the selected session/call are absent from drilled views.
   - Snapshot tests render header breadcrumbs for root, session-scoped, call-scoped, and detail routes.
 - Pass/fail signal:
-  - Pass if route stack, restored state, and breadcrumb strings match expectations.
-  - Fail if drilldown replaces unrelated filters, loses parent selection, or uses label-based rather than durable-ID scope.
+  - Pass if route stack, exact visible entity-ID sets, restored state, inspector/detail backing entities, and breadcrumb strings match expectations.
+  - Fail if drilldown replaces unrelated filters, loses parent selection, uses label-based rather than durable-ID scope, or shows an out-of-scope event/warning anywhere in the drilled route.
 - Tier:
   - `Tier 1 Autonomous`.
 - Wrong-but-plausible failures this must catch:
@@ -109,13 +120,15 @@ Each item below is binding. If implementation changes structure, it must still s
   - Inspector updates with list selection but never steals focus.
   - Expanded detail is a separate fullscreen layer with independent scroll behavior.
   - `q` quits only from workspace; otherwise it closes detail/overlay first.
+  - Under live ingest, inspector and expanded detail remain bound to the same selected entity ID as the pinned list row.
 - How it runs:
   - State-machine tests assert focus layer and key handling.
+  - Live-update tests open inspector and expanded detail on a pinned entity, prepend newer rows, and assert that list row, inspector payload, and detail payload still resolve to the same entity ID after each ingest step.
   - Snapshot tests render split mode and expanded detail mode from the same selected entity.
   - Buffer assertions verify inspector title/content and fullscreen detail title/content are distinct.
 - Pass/fail signal:
-  - Pass if split and detail layers coexist with the required unwind behavior.
-  - Fail if inspector becomes a second interactive pane, if detail reuses the split layout, or if `q` exits the app from detail.
+  - Pass if split and detail layers coexist with the required unwind behavior and entity identity remains stable under live updates.
+  - Fail if inspector becomes a second interactive pane, if detail reuses the split layout, if `q` exits the app from detail, or if inspector/detail silently drift to a different entity after prepends.
 - Tier:
   - `Tier 1 Autonomous`.
 - Wrong-but-plausible failures this must catch:
@@ -129,12 +142,17 @@ Each item below is binding. If implementation changes structure, it must still s
   - `?` opens help overlay from workspace and detail.
   - Help content includes global bindings, active-tab bindings, active-layer bindings, and one-line state summary.
   - `Esc`, `q`, and `?` close help without mutating underlying route state.
+  - Help is generated from the real active keymap/actions, not a hand-maintained text template.
 - How it runs:
   - State-machine tests open help from multiple routes and verify overlay stacking/unwinding.
+  - Help assertions derive the expected advertised key set from the same machine-readable keymap table used by input dispatch, then compare that set to rendered help content.
+  - Action tests prove every advertised key in that mode has a non-noop handler with the documented effect.
+  - Inverse tests prove inactive keys for that mode are not advertised.
+  - Modal conflict tests cover `q` and `Esc` across workspace, detail, and help overlay.
   - Snapshot tests capture help overlay content for `Events`, session-scoped `Correlated Tool Calls`, and expanded detail.
 - Pass/fail signal:
-  - Pass if mode-specific help text changes with state and overlay close leaves underlying state untouched.
-  - Fail if help is a static cheat sheet or if it omits breadcrumb/live state context.
+  - Pass if mode-specific help text changes with state, matches the active keymap table exactly, and overlay close leaves underlying state untouched.
+  - Fail if help is a static cheat sheet, advertises dead keys, omits active keys, or omits breadcrumb/live state context.
 - Tier:
   - `Tier 1 Autonomous`.
 - Wrong-but-plausible failures this must catch:
@@ -150,12 +168,14 @@ Each item below is binding. If implementation changes structure, it must still s
   - `f` resumes `LIVE` and clears unseen count for the current tab.
   - While pinned, new rows append without moving selection and unseen count increments only for the affected tab.
   - `Sessions -> Correlated Tool Calls` starts `LIVE` within the scoped session; other entity-specific drilldowns start `PINNED`.
+  - While pinned, inspector and expanded detail stay bound to the selected entity ID even as live ingest prepends rows ahead of it.
 - How it runs:
   - State-machine tests simulate ingest while tabs are live or pinned.
-  - Integration-style reducer tests append events after manual navigation and assert selected entity IDs plus unseen counters.
+  - Integration-style reducer tests append events after manual navigation and assert selected entity IDs, inspector/detail entity IDs, and unseen counters.
+  - A dedicated route test covers `Sessions -> Correlated Tool Calls` starting `LIVE`, manual navigation flipping that route to `PINNED`, and `f` resuming `LIVE` without losing session scope.
 - Pass/fail signal:
-  - Pass if selection movement and unseen counts match the contract exactly.
-  - Fail if unseen counts increment in `LIVE`, if one tab’s manual movement pins all tabs, or if drilldown default follow mode is wrong.
+  - Pass if selection movement, entity-ID stability, and unseen counts match the contract exactly.
+  - Fail if unseen counts increment in `LIVE`, if one tab’s manual movement pins all tabs, if drilldown default follow mode is wrong, or if pinned inspector/detail content drifts while the row appears stable.
 - Tier:
   - `Tier 1 Autonomous`.
 - Wrong-but-plausible failures this must catch:
@@ -192,12 +212,16 @@ Each item below is binding. If implementation changes structure, it must still s
   - Result-only events appear as `unknown` or `incomplete`, not dropped.
   - Fallback correlation closes only the oldest matching open call and marks `match_confidence=fallback_signature`.
   - Multi-tool transcript assistant messages fan out to one correlated call per tool call.
+  - Materialized correlated-call identities exactly match the fixture oracle, not just row count or visible labels.
+  - Transcript-bundle rows are labeled distinctly from explicit-ID and fallback-signature rows.
 - How it runs:
   - Derived-model unit tests for explicit-ID, fallback-signature, transcript-bundle, repeated no-ID calls, and result-only events.
-  - Fixture integration tests ingest synthetic transcript-v3 fixtures with two tool calls in one assistant message plus out-of-order results.
+  - Fixture integration tests ingest synthetic transcript-v3 fixtures with at least one assistant message containing three `toolCall` items where only the second receives a result first.
+  - Tests assert the full materialized identity set, using exact `(session_id, canonical_call_id)` or `(session_id, fallback_signature, ordinal)` keys.
+  - Tests assert each materialized call row has its own status, severity, event refs, confidence label, and drilldown scope.
 - Pass/fail signal:
-  - Pass if correlated rows, statuses, event refs, and confidence labels match the fixture oracle.
-  - Fail if correlation crosses sessions, if later no-ID calls close before older ones, or if extra transcript tool calls disappear into loose `correlation_ids`.
+  - Pass if the exact materialized identity set, statuses, severities, event refs, confidence labels, and per-call drilldown scopes match the fixture oracle.
+  - Fail if correlation crosses sessions, if later no-ID calls close before older ones, if extra transcript tool calls disappear into loose `correlation_ids`, or if any fallback-closed call is silently upgraded to a stronger confidence.
 - Tier:
   - `Tier 1 Autonomous`.
 - Wrong-but-plausible failures this must catch:
@@ -213,12 +237,20 @@ Each item below is binding. If implementation changes structure, it must still s
   - Session rows surface `health_status`.
   - `include_system_events=true` reveals heartbeat/system rows in `Events`.
   - `idle` vs `disconnected` depends on freshness/source state, not just open-call count.
+  - Session freshness/state fields are correct under time advancement:
+    - `last_event_at`
+    - `last_source_seen_at`
+    - `source_state`
+    - `health_status`
 - How it runs:
   - Derived-model tests simulate active, idle, stale, disconnected, and unknown sessions using controllable timestamps and source disappearance signals.
+  - Fixture coverage includes source disappeared, source still exists but silent, late event after disconnect, and disconnected sessions with zero open calls.
+  - Time-advanced tests assert a session can transition `busy -> idle -> disconnected` without opening any new calls.
+  - Negative assertions prove open-call count alone cannot keep a session `active` after freshness expiry.
   - Snapshot tests render headers and session rows with system events hidden and visible.
 - Pass/fail signal:
-  - Pass if default `Events` excludes heartbeat rows while header/session health stays correct.
-  - Fail if heartbeat rows always flood the event timeline, or if quiet/disconnected sessions collapse into the same state.
+  - Pass if default `Events` excludes heartbeat rows while the underlying freshness/state fields and rendered health status stay correct.
+  - Fail if heartbeat rows always flood the event timeline, if quiet/disconnected sessions collapse into the same state, or if rendered health badges disagree with the underlying freshness/state fields.
 - Tier:
   - `Tier 1 Autonomous`.
 - Wrong-but-plausible failures this must catch:
@@ -232,13 +264,19 @@ Each item below is binding. If implementation changes structure, it must still s
   - `since` and `until` are enforced, inclusive.
   - The same time-window semantics apply in non-TUI output and all TUI tabs.
   - Correlated calls and sessions use overlap semantics rather than only start time.
+  - Events, correlated calls, sessions, stale notices, and detail mode all honor the same time-window oracle.
 - How it runs:
   - Shared filter unit tests for raw events, correlated calls, and session summaries with edge timestamps at exact bounds.
   - CLI integration tests invoke the binary with `--since` and `--until` against controlled fixtures and assert output changes.
+  - One shared cross-projection oracle fixture is evaluated under the same `since` / `until` values and asserts exact visible entity-ID sets for `Events`, `Correlated Tool Calls`, `Sessions`, stale notices, and expanded detail mode.
+  - The oracle fixture must include:
+    - a call that starts before `since`, ends after `since`, and emits a stale warning after `since`
+    - a session with only pre-window events except for a post-window stale or disconnect transition
+    - detail-mode selection looked up from the filtered/scoped store, not an unfiltered global store
   - Derived projection tests assert a long-running call that overlaps the window still appears in `Correlated Tool Calls` and `Sessions`.
 - Pass/fail signal:
-  - Pass if the dataset shrinks/expands exactly at inclusive boundaries and projections agree across views.
-  - Fail if header text advertises time filters that do nothing, as in the current code.
+  - Pass if the dataset shrinks/expands exactly at inclusive boundaries and every projection, stale notice, and detail payload matches the same oracle.
+  - Fail if header text advertises time filters that do nothing, if any projection cheats with different overlap rules, or if detail mode resolves an out-of-window backing entity.
 - Tier:
   - `Tier 1 Autonomous`.
 - Wrong-but-plausible failures this must catch:
@@ -292,6 +330,7 @@ Each item below is binding. If implementation changes structure, it must still s
 - Extend [`src/stale.rs`](/home/anders/.openclaw/workspace/dev/openclaw-logpulse-worktrees/w25-verification-plan/src/stale.rs) tests for oldest-open fallback completion and session-isolated correlation.
 - Add derived-model tests near the future aggregation layer for:
   - correlated-call fan-out from transcript multi-tool messages
+  - exact materialized correlated-call identity sets and confidence labeling
   - result-only call rows
   - session identity precedence and ordering
   - session/source freshness and health-status derivation
@@ -301,7 +340,9 @@ Each item below is binding. If implementation changes structure, it must still s
   - drilldown/unwind
   - per-tab remembered state
   - live/pinned unseen behavior
+  - stable selected entity IDs across live prepends
   - help/detail overlay stacking
+  - contextual help parity with the machine-readable keymap table
 
 ### Add integration tests
 
@@ -310,6 +351,7 @@ Each item below is binding. If implementation changes structure, it must still s
   - transcript multi-tool-call inputs
   - result-only correlated calls surviving to output or internal projection harness
   - multi-session call ID collision isolation
+  - a shared cross-projection time-window oracle fixture
 
 ### Add snapshot/golden tests
 
@@ -356,6 +398,9 @@ The implementation wave must not rely only on happy-path fixtures. Verification 
 - heartbeat/system events interleaved with normal events
 - stale calls inside and outside active filters
 - calls spanning `since`/`until` boundaries
+- two source files sharing the same `session_key` but different path UUIDs
+- a transcript message with at least three `toolCall` items and out-of-order results
+- live prepends while a pinned inspector and expanded detail are open
 
 Without these fixtures, naive implementations will appear correct while violating the architecture contract.
 
@@ -365,5 +410,6 @@ These are the only acceptable remaining blind spots after Tier 1 and Tier 2 auto
 
 - Terminal-specific font rendering, color theme interpretation, and emulator quirks are not fully provable in CI.
 - Ratatui snapshot tests prove layout structure and visible text, but not subjective readability under every terminal theme.
+- Extremely timing-sensitive races between file-discovery churn and live ingest may still require separate implementation-wave stress coverage beyond this doc-focused contract.
 
 Those blind spots do not justify broad manual testing. They justify only the narrow Tier 3 artifact described above if snapshot evidence is insufficient.
