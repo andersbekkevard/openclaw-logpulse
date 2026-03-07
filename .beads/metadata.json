@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "openclaw_logpulse",
+  "project_id": "54a5252f-2d4a-453e-9b1f-ba5150cfcdb8"
+}
