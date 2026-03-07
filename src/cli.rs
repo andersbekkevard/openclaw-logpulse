@@ -1,5 +1,6 @@
-use crate::event::Severity;
+use crate::event::{Severity, TimeFilter};
 use crate::output::OutputMode;
+use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -86,4 +87,17 @@ impl Args {
     pub fn min_severity(&self) -> Severity {
         self.min_level.as_severity()
     }
+
+    pub fn time_filter(&self) -> Result<TimeFilter, String> {
+        Ok(TimeFilter {
+            since: self.since.as_deref().map(parse_cli_timestamp).transpose()?,
+            until: self.until.as_deref().map(parse_cli_timestamp).transpose()?,
+        })
+    }
+}
+
+fn parse_cli_timestamp(value: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|err| format!("invalid timestamp '{value}': {err}"))
 }

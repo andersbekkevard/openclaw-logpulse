@@ -234,6 +234,77 @@ fn transcript_v3_logs_include_session_agent_and_tool_context() {
 }
 
 #[test]
+fn transcript_multi_tool_messages_fan_out_to_distinct_events() {
+    let tmp = TempDir::new("transcript-v3-multi");
+    let log = tmp
+        .path()
+        .join(".openclaw")
+        .join("agents")
+        .join("main")
+        .join("sessions")
+        .join("12345678-1234-1234-1234-123456789abc.jsonl");
+    fs::create_dir_all(log.parent().expect("sessions dir")).expect("create sessions dir");
+
+    append_line(
+        &log,
+        r#"{"type":"message","id":"60167cca","parentId":"1f5ac5f2","timestamp":"2026-03-07T09:31:19.656Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_a","name":"read","arguments":{"file_path":"/tmp/a"}},{"type":"toolCall","id":"call_b","name":"read","arguments":{"file_path":"/tmp/b"}},{"type":"toolCall","id":"call_c","name":"exec","arguments":{"command":"pwd"}}],"stopReason":"toolUse","timestamp":1772875879655}}"#,
+    );
+
+    let (stdout, stderr, status) = run_cli(&[
+        "--no-follow",
+        "--from-start",
+        "--stale-seconds",
+        "1000000",
+        "--format",
+        "json",
+        log.to_str().expect("fixture path"),
+    ]);
+
+    assert_eq!(status, 0, "stderr: {stderr}");
+    let records = parse_json_lines(&stdout);
+    let events: Vec<_> = records
+        .iter()
+        .filter(|record| record.get("kind").and_then(Value::as_str) == Some("tool_event"))
+        .collect();
+    assert_eq!(events.len(), 3);
+    let call_ids: HashSet<_> = events
+        .iter()
+        .filter_map(|record| record.pointer("/event/call_id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(call_ids.len(), 3);
+}
+
+#[test]
+fn since_and_until_filter_actual_output() {
+    let (stdout, stderr, status) = run_cli(&[
+        "--no-follow",
+        "--from-start",
+        "--stale-seconds",
+        "1000000",
+        "--format",
+        "json",
+        "--since",
+        "2026-03-06T10:00:02Z",
+        "--until",
+        "2026-03-06T10:00:04Z",
+        fixture("session-mixed.fixture.jsonl")
+            .to_str()
+            .expect("fixture path"),
+    ]);
+
+    assert_eq!(status, 0, "stderr: {stderr}");
+    let records = parse_json_lines(&stdout);
+    let timestamps: Vec<_> = records
+        .iter()
+        .filter_map(|record| record.pointer("/event/timestamp").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        timestamps,
+        vec!["2026-03-06T10:00:02Z", "2026-03-06T10:00:04Z"]
+    );
+}
+
+#[test]
 fn follow_mode_handles_rotation_switching_files() {
     let tmp = TempDir::new("rotation");
     let current = tmp.path().join("session-live.jsonl");

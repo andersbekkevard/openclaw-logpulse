@@ -53,6 +53,66 @@ pub enum ToolEventKind {
     Malformed,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TimeFilter {
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+}
+
+impl TimeFilter {
+    pub fn contains(&self, timestamp: Option<DateTime<Utc>>) -> bool {
+        let Some(timestamp) = timestamp else {
+            return self.since.is_none() && self.until.is_none();
+        };
+
+        if let Some(since) = self.since {
+            if timestamp < since {
+                return false;
+            }
+        }
+
+        if let Some(until) = self.until {
+            if timestamp > until {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    #[allow(dead_code)]
+    pub fn intersects(
+        &self,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        fallback: Option<DateTime<Utc>>,
+    ) -> bool {
+        if self.since.is_none() && self.until.is_none() {
+            return true;
+        }
+
+        let effective_start = start.or(end).or(fallback);
+        let effective_end = end.or(start).or(fallback);
+        let (Some(effective_start), Some(effective_end)) = (effective_start, effective_end) else {
+            return false;
+        };
+
+        if let Some(until) = self.until {
+            if effective_start > until {
+                return false;
+            }
+        }
+
+        if let Some(since) = self.since {
+            if effective_end < since {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NormalizedEvent {
     pub kind: ToolEventKind,
@@ -80,6 +140,8 @@ pub struct NormalizedEvent {
     pub correlation_ids: Vec<String>,
     pub message_id: Option<String>,
     pub parent_message_id: Option<String>,
+    pub transcript_tool_call_index: Option<usize>,
+    pub transcript_tool_call_count: Option<usize>,
     pub level: Severity,
     pub level_raw: Option<String>,
     pub params: Vec<(String, String)>,
@@ -97,17 +159,22 @@ impl NormalizedEvent {
         agent_substring: Option<&String>,
         tool_name: Option<&String>,
         min_level: Severity,
+        time_filter: Option<&TimeFilter>,
     ) -> bool {
         if !self.level.should_emit(min_level) {
             return false;
         }
 
+        if let Some(time_filter) = time_filter {
+            if !time_filter.contains(self.timestamp) {
+                return false;
+            }
+        }
+
         if let Some(session_filter) = session_substring {
             let needle = session_filter.to_ascii_lowercase();
             let session_matches = self
-                .session_key
-                .as_ref()
-                .or(self.session_id.as_ref())
+                .session_label()
                 .map(|value| value.to_ascii_lowercase().contains(&needle))
                 .unwrap_or(false);
             if !session_matches {
@@ -146,12 +213,20 @@ impl NormalizedEvent {
         self.call_ids
             .iter()
             .map(|value| value.as_str())
-            .chain(self.call_id.as_deref().into_iter())
+            .chain(self.call_id.as_deref())
             .chain(self.correlation_ids.iter().map(|value| value.as_str()))
     }
 
+    pub fn durable_session_id(&self) -> Option<&str> {
+        self.session_id.as_deref().or(self.session_key.as_deref())
+    }
+
+    pub fn session_label(&self) -> Option<&String> {
+        self.session_key.as_ref().or(self.session_id.as_ref())
+    }
+
     pub fn fallback_signature(&self) -> Option<String> {
-        let session = self.session_key.as_ref().or(self.session_id.as_ref())?;
+        let session = self.durable_session_id()?;
         let tool = self.tool_name.as_ref()?;
         let detail = self
             .preferred_identity_hint()

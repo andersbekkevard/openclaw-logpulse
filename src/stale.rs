@@ -250,6 +250,8 @@ mod tests {
             correlation_ids: call_ids.iter().map(|value| (*value).to_string()).collect(),
             message_id: None,
             parent_message_id: None,
+            transcript_tool_call_index: None,
+            transcript_tool_call_count: None,
             level: Severity::Info,
             level_raw: Some("info".to_string()),
             params: Vec::new(),

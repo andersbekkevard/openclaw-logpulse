@@ -191,13 +191,20 @@ pub fn normalize(line: &str) -> NormalizedEvent {
 }
 
 pub fn normalize_with_source(line: &str, source_path: Option<&Path>) -> NormalizedEvent {
+    normalize_many_with_source(line, source_path)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| empty_event(line.to_string()))
+}
+
+pub fn normalize_many_with_source(line: &str, source_path: Option<&Path>) -> Vec<NormalizedEvent> {
     match crate::parser::parse_line(line) {
-        ParsedLine::Malformed { raw_line, reason } => NormalizedEvent {
+        ParsedLine::Malformed { raw_line, reason } => vec![NormalizedEvent {
             kind: ToolEventKind::Malformed,
             result_summary: Some(reason),
             result_preview: None,
             ..empty_event(raw_line)
-        },
+        }],
         ParsedLine::Json(value) => normalize_json(line, &value, source_path),
     }
 }
@@ -228,6 +235,8 @@ fn empty_event(raw_line: String) -> NormalizedEvent {
         correlation_ids: Vec::new(),
         message_id: None,
         parent_message_id: None,
+        transcript_tool_call_index: None,
+        transcript_tool_call_count: None,
         level: Severity::Unknown,
         level_raw: None,
         params: Vec::new(),
@@ -239,21 +248,22 @@ fn empty_event(raw_line: String) -> NormalizedEvent {
     }
 }
 
-fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> NormalizedEvent {
+fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> Vec<NormalizedEvent> {
     if value.as_object().is_none() {
-        return NormalizedEvent {
+        return vec![NormalizedEvent {
             kind: ToolEventKind::Malformed,
             timestamp_raw: Some(raw.to_string()),
             result_summary: Some("non-object json entry".to_string()),
             message: Some(raw.to_string()),
             ..empty_event(raw.to_string())
-        };
+        }];
     }
 
     let source_context = SourceContext::from_path(source_path);
 
-    if let Some(event) = normalize_transcript_event(raw, value, &source_context) {
-        return event;
+    let transcript_events = normalize_transcript_event(raw, value, &source_context);
+    if !transcript_events.is_empty() {
+        return transcript_events;
     }
 
     let (timestamp, timestamp_raw) = parse_timestamp(value);
@@ -264,7 +274,7 @@ fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> Norma
         .unwrap_or(Severity::Unknown);
 
     let session_key = first_string_from_paths(value, SESSION_PATHS);
-    let session_id = session_key.clone().or(source_context.session_id.clone());
+    let session_id = source_context.session_id.clone();
 
     let agent_id = first_string_from_paths(value, AGENT_PATHS).or(source_context.agent_id.clone());
     let tool_name = first_string_from_paths(value, TOOL_PATHS);
@@ -279,7 +289,7 @@ fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> Norma
     let kind = infer_kind(value, raw, status.as_deref(), &correlation_ids);
     let params = extract_params(value);
 
-    NormalizedEvent {
+    vec![NormalizedEvent {
         kind,
         timestamp,
         timestamp_raw,
@@ -307,6 +317,8 @@ fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> Norma
         correlation_ids,
         message_id: None,
         parent_message_id: None,
+        transcript_tool_call_index: None,
+        transcript_tool_call_count: None,
         level,
         level_raw,
         params: params.clone(),
@@ -315,7 +327,7 @@ fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> Norma
         args_truncated: false,
         message,
         raw_line: raw.to_string(),
-    }
+    }]
 }
 
 #[derive(Clone, Debug, Default)]
@@ -366,8 +378,10 @@ fn normalize_transcript_event(
     raw: &str,
     value: &Value,
     source_context: &SourceContext,
-) -> Option<NormalizedEvent> {
-    let entry_type = value.get("type")?.as_str()?;
+) -> Vec<NormalizedEvent> {
+    let Some(entry_type) = value.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
     let (timestamp, timestamp_raw) = parse_timestamp(value);
     let session_id = if entry_type == "session" {
         value
@@ -381,7 +395,7 @@ fn normalize_transcript_event(
     let agent_id = source_context.agent_id.clone();
 
     match entry_type {
-        "session" => Some(NormalizedEvent {
+        "session" => vec![NormalizedEvent {
             kind: ToolEventKind::Other,
             timestamp,
             timestamp_raw,
@@ -392,12 +406,13 @@ fn normalize_transcript_event(
             level_raw: Some("info".to_string()),
             message: Some("session started".to_string()),
             source_kind: Some("transcript_v3".to_string()),
+            message_id: value.get("id").and_then(Value::as_str).map(str::to_string),
             ..empty_event(raw.to_string())
-        }),
+        }],
         "message" => {
             normalize_transcript_message(raw, value, timestamp, timestamp_raw, session_id, agent_id)
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -408,8 +423,15 @@ fn normalize_transcript_message(
     timestamp_raw: Option<String>,
     session_id: Option<String>,
     agent_id: Option<String>,
-) -> Option<NormalizedEvent> {
-    let message = value.get("message")?;
+) -> Vec<NormalizedEvent> {
+    let Some(message) = value.get("message") else {
+        return Vec::new();
+    };
+    let message_id = value.get("id").and_then(Value::as_str).map(str::to_string);
+    let parent_message_id = value
+        .get("parentId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let role = message
         .get("role")
         .and_then(Value::as_str)
@@ -427,7 +449,7 @@ fn normalize_transcript_message(
             _ => "info".to_string(),
         });
 
-        return Some(NormalizedEvent {
+        return vec![NormalizedEvent {
             kind: ToolEventKind::ToolCallResult,
             timestamp,
             timestamp_raw,
@@ -447,8 +469,14 @@ fn normalize_transcript_message(
                 .or_else(|| first_string_from_paths(message, &[&["details", "aggregated"]]))
                 .or_else(|| first_string_from_paths(message, &[&["details", "status"]])),
             call_id: first_string_from_paths(message, &[&["toolCallId"]]),
-            call_ids: first_string_from_paths(message, &[&["toolCallId"]]).into_iter().collect(),
+            call_ids: first_string_from_paths(message, &[&["toolCallId"]])
+                .into_iter()
+                .collect(),
             correlation_ids: Vec::new(),
+            message_id,
+            parent_message_id,
+            transcript_tool_call_index: None,
+            transcript_tool_call_count: None,
             level,
             level_raw,
             params: extract_transcript_result_params(message),
@@ -457,7 +485,7 @@ fn normalize_transcript_message(
             message: first_string_from_paths(message, &[&["details", "aggregated"]])
                 .or_else(|| first_text_content(&content)),
             ..empty_event(raw.to_string())
-        });
+        }];
     }
 
     let tool_calls = content
@@ -465,48 +493,56 @@ fn normalize_transcript_message(
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("toolCall"))
         .collect::<Vec<_>>();
 
-    if let Some(first_tool_call) = tool_calls.first() {
-        let mut correlation_ids = tool_calls
+    if !tool_calls.is_empty() {
+        let tool_call_count = tool_calls.len();
+        return tool_calls
             .iter()
-            .skip(1)
-            .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
-            .collect::<Vec<_>>();
-        correlation_ids.dedup();
-
-        return Some(NormalizedEvent {
-            kind: ToolEventKind::ToolCallStart,
-            timestamp,
-            timestamp_raw,
-            session_id,
-            agent_id,
-            tool_name: first_string_from_paths(first_tool_call, &[&["name"]]),
-            status: Some("started".to_string()),
-            call_id: first_string_from_paths(first_tool_call, &[&["id"]]),
-            call_ids: first_string_from_paths(first_tool_call, &[&["id"]]).into_iter().collect(),
-            correlation_ids,
-            level: Severity::Info,
-            level_raw: Some("info".to_string()),
-            params: first_tool_call
-                .get("arguments")
-                .map(extract_params_from_value)
-                .unwrap_or_default(),
-            args_preview: first_tool_call
-                .get("arguments")
-                .map(extract_params_from_value)
-                .unwrap_or_default(),
-            source_kind: Some("transcript_v3".to_string()),
-            message: first_string_from_paths(message, &[&["stopReason"]])
-                .or_else(|| first_text_content(&content)),
-            ..empty_event(raw.to_string())
-        });
+            .enumerate()
+            .map(|(index, tool_call)| NormalizedEvent {
+                kind: ToolEventKind::ToolCallStart,
+                timestamp,
+                timestamp_raw: timestamp_raw.clone(),
+                session_id: session_id.clone(),
+                agent_id: agent_id.clone(),
+                tool_name: first_string_from_paths(tool_call, &[&["name"]]),
+                status: Some("started".to_string()),
+                call_id: first_string_from_paths(tool_call, &[&["id"]]),
+                call_ids: first_string_from_paths(tool_call, &[&["id"]])
+                    .into_iter()
+                    .collect(),
+                correlation_ids: Vec::new(),
+                message_id: message_id.clone(),
+                parent_message_id: parent_message_id.clone(),
+                transcript_tool_call_index: Some(index),
+                transcript_tool_call_count: Some(tool_call_count),
+                level: Severity::Info,
+                level_raw: Some("info".to_string()),
+                params: tool_call
+                    .get("arguments")
+                    .map(extract_params_from_value)
+                    .unwrap_or_default(),
+                args_preview: tool_call
+                    .get("arguments")
+                    .map(extract_params_from_value)
+                    .unwrap_or_default(),
+                source_kind: Some("transcript_v3".to_string()),
+                message: first_string_from_paths(message, &[&["stopReason"]])
+                    .or_else(|| first_text_content(&content)),
+                ..empty_event(raw.to_string())
+            })
+            .collect();
     }
 
-    Some(NormalizedEvent {
+    vec![NormalizedEvent {
         kind: ToolEventKind::Other,
         timestamp,
         timestamp_raw,
         session_id,
         agent_id,
+        message_id,
+        parent_message_id,
+        transcript_tool_call_index: None,
+        transcript_tool_call_count: None,
         status: first_string_from_paths(message, &[&["stopReason"]]).or_else(|| {
             if role.is_empty() {
                 None
@@ -519,7 +555,7 @@ fn normalize_transcript_message(
         source_kind: Some("transcript_v3".to_string()),
         message: None,
         ..empty_event(raw.to_string())
-    })
+    }]
 }
 
 fn transcript_level(message: &Value) -> Severity {
@@ -927,7 +963,7 @@ fn truncate(text: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize, normalize_with_source};
+    use super::{normalize, normalize_many_with_source, normalize_with_source};
     use std::path::Path;
 
     #[test]
@@ -991,25 +1027,30 @@ mod tests {
     #[test]
     fn parse_transcript_tool_call_with_source_context() {
         let line = r#"{"type":"message","id":"60167cca","parentId":"1f5ac5f2","timestamp":"2026-03-07T09:31:19.656Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"**Executing startup file reads**"},{"type":"toolCall","id":"call_KF57u6qJpwvTbrDMQnUr0Xcn|fc_09fca533eb0e7ec50169abf0677fa481918b205ee92908fae8","name":"read","arguments":{"file_path":"/home/anders/.openclaw/workspace/SOUL.md"}},{"type":"toolCall","id":"call_FePapL6miWnHFE838k8CvEE8|fc_09fca533eb0e7ec50169abf0677fb881919daea143ac903c9a","name":"read","arguments":{"file_path":"/home/anders/.openclaw/workspace/USER.md"}}],"stopReason":"toolUse","timestamp":1772875879655}}"#;
-        let normalized = normalize_with_source(
+        let normalized = normalize_many_with_source(
             line,
             Some(Path::new(
                 "/home/anders/.openclaw/agents/main/sessions/45b95685-dd1e-417f-9730-162a25f6e1b4.jsonl",
             )),
         );
 
-        assert!(matches!(
-            normalized.kind,
-            crate::event::ToolEventKind::ToolCallStart
-        ));
+        assert_eq!(normalized.len(), 2);
+        assert!(normalized
+            .iter()
+            .all(|event| matches!(event.kind, crate::event::ToolEventKind::ToolCallStart)));
         assert_eq!(
-            normalized.session_id.as_deref(),
+            normalized[0].session_id.as_deref(),
             Some("45b95685-dd1e-417f-9730-162a25f6e1b4")
         );
-        assert_eq!(normalized.agent_id.as_deref(), Some("main"));
-        assert_eq!(normalized.tool_name.as_deref(), Some("read"));
-        assert_eq!(normalized.params.len(), 1);
-        assert_eq!(normalized.correlation_ids.len(), 1);
+        assert_eq!(normalized[0].agent_id.as_deref(), Some("main"));
+        assert_eq!(normalized[0].tool_name.as_deref(), Some("read"));
+        assert_eq!(normalized[0].params.len(), 1);
+        assert!(normalized
+            .iter()
+            .all(|event| event.correlation_ids.is_empty()));
+        assert_eq!(normalized[0].transcript_tool_call_index, Some(0));
+        assert_eq!(normalized[1].transcript_tool_call_index, Some(1));
+        assert_eq!(normalized[0].transcript_tool_call_count, Some(2));
     }
 
     #[test]
@@ -1035,5 +1076,22 @@ mod tests {
         assert_eq!(normalized.status.as_deref(), Some("completed"));
         assert_eq!(normalized.params.len(), 3);
         assert!(normalized.result_summary.is_some());
+    }
+
+    #[test]
+    fn path_session_id_is_not_overridden_by_session_key() {
+        let line = r#"{"event":"tool_call_start","timestamp":"2026-03-06T20:00:00Z","session_key":"friendly-session","tool":"search","call_id":"abc","level":"info"}"#;
+        let normalized = normalize_with_source(
+            line,
+            Some(Path::new(
+                "/home/anders/.openclaw/agents/main/sessions/45b95685-dd1e-417f-9730-162a25f6e1b4.jsonl",
+            )),
+        );
+
+        assert_eq!(normalized.session_key.as_deref(), Some("friendly-session"));
+        assert_eq!(
+            normalized.session_id.as_deref(),
+            Some("45b95685-dd1e-417f-9730-162a25f6e1b4")
+        );
     }
 }

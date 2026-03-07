@@ -1,6 +1,6 @@
 use crate::cli::Args;
 use crate::event::{NormalizedEvent, Severity, ToolEventKind};
-use crate::normalizer::normalize_with_source;
+use crate::normalizer::normalize_many_with_source;
 use crate::stale::{HeartbeatSummary, StaleTracker, StaleWarning};
 use crate::{discovery, tailer};
 use chrono::{DateTime, Local, Utc};
@@ -30,7 +30,7 @@ const PREVIEW_LEN: usize = 72;
 
 #[derive(Clone)]
 enum TimelineItem {
-    ToolEvent(NormalizedEvent),
+    ToolEvent(Box<NormalizedEvent>),
     StaleWarning {
         warning: StaleWarning,
         seen_at: DateTime<Utc>,
@@ -251,6 +251,9 @@ impl App {
 }
 
 pub fn run(args: &Args) -> io::Result<()> {
+    let time_filter = args
+        .time_filter()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -258,7 +261,7 @@ pub fn run(args: &Args) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let result = run_app(&mut terminal, args);
+    let result = run_app(&mut terminal, args, &time_filter);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -270,6 +273,7 @@ pub fn run(args: &Args) -> io::Result<()> {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     args: &Args,
+    time_filter: &crate::event::TimeFilter,
 ) -> io::Result<()> {
     let filter_summary = format_filters(args);
     let mut app = App::new(filter_summary);
@@ -308,7 +312,7 @@ fn run_app(
                 last_scan = now;
             }
 
-            drain_multi_tailer(&mut tailer, args, &mut tracker, &mut app);
+            drain_multi_tailer(&mut tailer, args, time_filter, &mut tracker, &mut app);
             terminal.draw(|frame| render(frame, &app))?;
         }
 
@@ -349,7 +353,14 @@ fn run_app(
             last_heartbeat = now;
         }
 
-        drain_single_tailer(&mut tailer, &log_file, args, &mut tracker, &mut app);
+        drain_single_tailer(
+            &mut tailer,
+            &log_file,
+            args,
+            time_filter,
+            &mut tracker,
+            &mut app,
+        );
         terminal.draw(|frame| render(frame, &app))?;
     }
 
@@ -388,13 +399,21 @@ fn handle_input(app: &mut App, timeout: Duration) -> io::Result<bool> {
 fn drain_multi_tailer(
     tailer: &mut tailer::MultiTailer,
     args: &Args,
+    time_filter: &crate::event::TimeFilter,
     tracker: &mut StaleTracker,
     app: &mut App,
 ) {
     for _ in 0..DRAIN_PER_TICK {
         match tailer.next_line() {
             Ok(Some((path, raw_line))) => {
-                ingest_line(&raw_line, Some(path.as_path()), args, tracker, app);
+                ingest_line(
+                    &raw_line,
+                    Some(path.as_path()),
+                    args,
+                    time_filter,
+                    tracker,
+                    app,
+                );
             }
             Ok(None) => break,
             Err(err) => {
@@ -409,12 +428,15 @@ fn drain_single_tailer(
     tailer: &mut tailer::Tailer,
     log_file: &Path,
     args: &Args,
+    time_filter: &crate::event::TimeFilter,
     tracker: &mut StaleTracker,
     app: &mut App,
 ) {
     for _ in 0..DRAIN_PER_TICK {
         match tailer.next_line() {
-            Ok(Some(raw_line)) => ingest_line(&raw_line, Some(log_file), args, tracker, app),
+            Ok(Some(raw_line)) => {
+                ingest_line(&raw_line, Some(log_file), args, time_filter, tracker, app)
+            }
             Ok(None) => break,
             Err(err) => {
                 app.push_error(err.to_string());
@@ -428,53 +450,60 @@ fn ingest_line(
     raw_line: &str,
     source_path: Option<&Path>,
     args: &Args,
+    time_filter: &crate::event::TimeFilter,
     tracker: &mut StaleTracker,
     app: &mut App,
 ) {
-    let event = normalize_with_source(raw_line, source_path);
-    let notices = tracker.on_event(&event, Utc::now());
+    let now = Utc::now();
+    for event in normalize_many_with_source(raw_line, source_path) {
+        let notices = tracker.on_event(&event, now);
 
-    if event.should_filter(
-        args.session.as_ref(),
-        args.agent.as_ref(),
-        args.tool.as_ref(),
-        args.min_severity(),
-    ) {
-        app.push_item(TimelineItem::ToolEvent(event));
-    }
-
-    for warning in notices {
-        let session_matches = args.session.as_ref().map(|needle| {
-            warning
-                .session_key
-                .as_ref()
-                .map(|value| {
-                    value
-                        .to_ascii_lowercase()
-                        .contains(&needle.to_ascii_lowercase())
-                })
-                .unwrap_or(false)
-        });
-        let tool_matches = args.tool.as_ref().map(|needle| {
-            warning
-                .tool_name
-                .as_ref()
-                .map(|value| {
-                    value
-                        .to_ascii_lowercase()
-                        .contains(&needle.to_ascii_lowercase())
-                })
-                .unwrap_or(false)
-        });
-
-        if session_matches == Some(false) || tool_matches == Some(false) {
-            continue;
+        if event.should_filter(
+            args.session.as_ref(),
+            args.agent.as_ref(),
+            args.tool.as_ref(),
+            args.min_severity(),
+            Some(time_filter),
+        ) {
+            app.push_item(TimelineItem::ToolEvent(Box::new(event)));
         }
 
-        app.push_item(TimelineItem::StaleWarning {
-            warning,
-            seen_at: Utc::now(),
-        });
+        for warning in notices {
+            if !time_filter.contains(Some(now)) {
+                continue;
+            }
+            let session_matches = args.session.as_ref().map(|needle| {
+                warning
+                    .session_key
+                    .as_ref()
+                    .map(|value| {
+                        value
+                            .to_ascii_lowercase()
+                            .contains(&needle.to_ascii_lowercase())
+                    })
+                    .unwrap_or(false)
+            });
+            let tool_matches = args.tool.as_ref().map(|needle| {
+                warning
+                    .tool_name
+                    .as_ref()
+                    .map(|value| {
+                        value
+                            .to_ascii_lowercase()
+                            .contains(&needle.to_ascii_lowercase())
+                    })
+                    .unwrap_or(false)
+            });
+
+            if session_matches == Some(false) || tool_matches == Some(false) {
+                continue;
+            }
+
+            app.push_item(TimelineItem::StaleWarning {
+                warning,
+                seen_at: now,
+            });
+        }
     }
 }
 

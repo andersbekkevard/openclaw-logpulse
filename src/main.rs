@@ -4,6 +4,7 @@ mod event;
 mod normalizer;
 mod output;
 mod parser;
+mod projection;
 mod stale;
 mod tailer;
 mod tui;
@@ -17,7 +18,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::cli::Args;
-use crate::normalizer::normalize_with_source;
+use crate::normalizer::normalize_many_with_source;
 use crate::output::{effective_mode, OutputMode};
 use crate::stale::StaleTracker;
 
@@ -26,6 +27,13 @@ const MISSING_TTL_SECONDS: u64 = 30;
 fn main() {
     let (mut args, auto_discover) = parse_args();
     args.format = effective_mode(args.format);
+    let time_filter = match args.time_filter() {
+        Ok(filter) => filter,
+        Err(err) => {
+            eprintln!("{err}");
+            return;
+        }
+    };
 
     if args.format == OutputMode::Tui {
         if let Err(err) = tui::run(&args) {
@@ -77,6 +85,7 @@ fn main() {
                         &raw_line,
                         Some(path.as_path()),
                         &args,
+                        &time_filter,
                         &mut tracker,
                         &mut stdout,
                         &mut stderr,
@@ -137,6 +146,7 @@ fn main() {
                     &raw_line,
                     args.log_file.as_deref(),
                     &args,
+                    &time_filter,
                     &mut tracker,
                     &mut stdout,
                     &mut stderr,
@@ -160,28 +170,34 @@ fn process_raw_line(
     raw_line: &str,
     source_path: Option<&Path>,
     args: &Args,
+    time_filter: &crate::event::TimeFilter,
     tracker: &mut StaleTracker,
     stdout: &mut BufWriter<impl Write>,
     stderr: &mut BufWriter<impl Write>,
 ) {
-    let event = normalize_with_source(raw_line, source_path);
     let now = Utc::now();
-    let notices = tracker.on_event(&event, now);
+    for event in normalize_many_with_source(raw_line, source_path) {
+        let notices = tracker.on_event(&event, now);
 
-    if event.should_filter(
-        args.session.as_ref(),
-        args.agent.as_ref(),
-        args.tool.as_ref(),
-        args.min_severity(),
-    ) {
-        if let Err(err) = output::emit_tool_event(&event, args.format, stdout) {
-            let _ = writeln!(stderr, "{}", err);
+        if event.should_filter(
+            args.session.as_ref(),
+            args.agent.as_ref(),
+            args.tool.as_ref(),
+            args.min_severity(),
+            Some(time_filter),
+        ) {
+            if let Err(err) = output::emit_tool_event(&event, args.format, stdout) {
+                let _ = writeln!(stderr, "{}", err);
+            }
         }
-    }
 
-    for warning in notices {
-        if let Err(err) = output::emit_stale_warning(&warning, args.format, stdout) {
-            let _ = writeln!(stderr, "{}", err);
+        for warning in notices {
+            if !time_filter.contains(Some(now)) {
+                continue;
+            }
+            if let Err(err) = output::emit_stale_warning(&warning, args.format, stdout) {
+                let _ = writeln!(stderr, "{}", err);
+            }
         }
     }
 
