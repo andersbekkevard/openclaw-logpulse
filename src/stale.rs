@@ -27,6 +27,7 @@ pub struct StaleTracker {
 pub struct StaleWarning {
     pub call_id: String,
     pub session_key: Option<String>,
+    pub session_id: Option<String>,
     pub tool_name: Option<String>,
     pub age_seconds: u64,
     pub message: Option<String>,
@@ -194,6 +195,7 @@ impl StaleTracker {
                 warnings.push(StaleWarning {
                     call_id: call.internal_id.clone(),
                     session_key: call.session_key.clone(),
+                    session_id: call.session_id.clone(),
                     tool_name: call.tool_name.clone(),
                     age_seconds,
                     message: call.message.clone().or_else(|| {

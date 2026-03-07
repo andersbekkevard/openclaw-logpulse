@@ -482,6 +482,7 @@ struct App {
     route_stack: Vec<RouteSnapshot>,
     detail: Option<DetailState>,
     help_open: bool,
+    help_scroll: u16,
     filters: WorkspaceFilters,
     health: HealthConfig,
     next_notice_id: u64,
@@ -504,6 +505,7 @@ impl App {
             route_stack: Vec::new(),
             detail: None,
             help_open: false,
+            help_scroll: 0,
             filters,
             health: HealthConfig {
                 stale_after: chrono::Duration::seconds(stale_after_seconds as i64),
@@ -717,9 +719,7 @@ impl App {
             })
             .collect::<Vec<_>>();
 
-        if allowed_refs.is_none() {
-            rows.extend(self.visible_notice_rows(scope));
-        }
+        rows.extend(self.visible_notice_rows(scope));
 
         rows.sort_by(|a, b| {
             b.sort_at
@@ -730,12 +730,28 @@ impl App {
     }
 
     fn visible_notice_rows(&self, scope: &DrilldownScope) -> Vec<VisibleRow> {
+        let scoped_call = scope
+            .call_entity_id
+            .as_ref()
+            .and_then(|call_id| self.call_by_id(call_id));
         self.notices
             .iter()
             .filter_map(|notice| match &notice.kind {
                 NoticeKind::Stale(warning) => {
-                    if scope.session_id.is_some() {
-                        return None;
+                    if let Some(session_id) = scope.session_id.as_ref() {
+                        let in_session = warning.session_id.as_deref() == Some(session_id.as_str())
+                            || warning.session_key.as_deref() == Some(session_id.as_str());
+                        if !in_session {
+                            return None;
+                        }
+                    }
+                    if let Some(call) = scoped_call.as_ref() {
+                        let matches_call_id = call.canonical_call_id.as_deref()
+                            == Some(warning.call_id.as_str())
+                            || call.call_entity_id == warning.call_id;
+                        if !matches_call_id {
+                            return None;
+                        }
                     }
                     let searchable = format!(
                         "{} {} {}",
@@ -972,6 +988,7 @@ impl App {
     fn unwind_route(&mut self) -> bool {
         if self.help_open {
             self.help_open = false;
+            self.help_scroll = 0;
             return false;
         }
         if self.detail.is_some() {
@@ -1521,40 +1538,88 @@ fn handle_input(app: &mut App, timeout: Duration) -> io::Result<bool> {
             return Ok(false);
         };
 
-        match action {
-            Action::Close => return Ok(app.unwind_route()),
-            Action::NextRow => app.move_selection(1),
-            Action::PreviousRow => app.move_selection(-1),
-            Action::FirstRow => app.jump_to(0),
-            Action::LastRow => {
-                let last = app.visible_rows(app.current_tab).len().saturating_sub(1);
-                app.jump_to(last);
-            }
-            Action::ScrollDown => {
-                if let Some(detail) = app.detail.as_mut() {
-                    detail.scroll = detail.scroll.saturating_add(1);
-                }
-            }
-            Action::ScrollUp => {
-                if let Some(detail) = app.detail.as_mut() {
-                    detail.scroll = detail.scroll.saturating_sub(1);
-                }
-            }
-            Action::ResumeLive => app.resume_live(),
-            Action::PreviousTab => app.switch_tab(app.current_tab.previous()),
-            Action::NextTab => app.switch_tab(app.current_tab.next()),
-            Action::TabEvents => app.switch_tab(Tab::Events),
-            Action::TabCalls => app.switch_tab(Tab::Calls),
-            Action::TabSessions => app.switch_tab(Tab::Sessions),
-            Action::Activate => app.activate_selected(),
-            Action::OpenDetail => app.open_detail(),
-            Action::ToggleHelp => {
-                app.help_open = !app.help_open;
-            }
-        }
+        return Ok(perform_action(app, action));
     }
 
     Ok(false)
+}
+
+fn perform_action(app: &mut App, action: Action) -> bool {
+    match action {
+        Action::Close => app.unwind_route(),
+        Action::NextRow => {
+            app.move_selection(1);
+            false
+        }
+        Action::PreviousRow => {
+            app.move_selection(-1);
+            false
+        }
+        Action::FirstRow => {
+            app.jump_to(0);
+            false
+        }
+        Action::LastRow => {
+            let last = app.visible_rows(app.current_tab).len().saturating_sub(1);
+            app.jump_to(last);
+            false
+        }
+        Action::ScrollDown => {
+            if app.help_open {
+                app.help_scroll = app.help_scroll.saturating_add(1);
+            } else if let Some(detail) = app.detail.as_mut() {
+                detail.scroll = detail.scroll.saturating_add(1);
+            }
+            false
+        }
+        Action::ScrollUp => {
+            if app.help_open {
+                app.help_scroll = app.help_scroll.saturating_sub(1);
+            } else if let Some(detail) = app.detail.as_mut() {
+                detail.scroll = detail.scroll.saturating_sub(1);
+            }
+            false
+        }
+        Action::ResumeLive => {
+            app.resume_live();
+            false
+        }
+        Action::PreviousTab => {
+            app.switch_tab(app.current_tab.previous());
+            false
+        }
+        Action::NextTab => {
+            app.switch_tab(app.current_tab.next());
+            false
+        }
+        Action::TabEvents => {
+            app.switch_tab(Tab::Events);
+            false
+        }
+        Action::TabCalls => {
+            app.switch_tab(Tab::Calls);
+            false
+        }
+        Action::TabSessions => {
+            app.switch_tab(Tab::Sessions);
+            false
+        }
+        Action::Activate => {
+            app.activate_selected();
+            false
+        }
+        Action::OpenDetail => {
+            app.open_detail();
+            false
+        }
+        Action::ToggleHelp => {
+            app.help_open = !app.help_open;
+            if app.help_open {
+                app.help_scroll = 0;
+            }
+            false
+        }
+    }
 }
 
 fn drain_multi_tailer(tailer: &mut tailer::MultiTailer, tracker: &mut StaleTracker, app: &mut App) {
@@ -1609,6 +1674,14 @@ fn ingest_line(
 }
 
 fn render(frame: &mut Frame, app: &App) {
+    if app.detail.is_some() {
+        render_detail(frame, frame.area(), app);
+        if app.help_open {
+            render_help(frame, app);
+        }
+        return;
+    }
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1619,11 +1692,7 @@ fn render(frame: &mut Frame, app: &App) {
         .split(frame.area());
 
     render_header(frame, layout[0], app);
-    if app.detail.is_some() {
-        render_detail(frame, layout[1], app);
-    } else {
-        render_workspace(frame, layout[1], app);
-    }
+    render_workspace(frame, layout[1], app);
     render_footer(frame, layout[2], app);
 
     if app.help_open {
@@ -1837,7 +1906,8 @@ fn render_help(frame: &mut Frame, app: &App) {
                 .borders(Borders::ALL)
                 .title("Contextual Help"),
         )
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((app.help_scroll, 0));
     frame.render_widget(paragraph, popup);
 }
 
@@ -2144,8 +2214,9 @@ mod tests {
         }
         app.ingest_warning(
             StaleWarning {
-                call_id: "call-stale".to_string(),
+                call_id: "call-1".to_string(),
                 session_key: Some("label-shared".to_string()),
+                session_id: Some("session-a".to_string()),
                 tool_name: Some("shell".to_string()),
                 age_seconds: 45,
                 message: Some("stuck shell".to_string()),
@@ -2225,6 +2296,7 @@ mod tests {
         assert_eq!(
             event_ids,
             vec![
+                EntityKey::Notice("notice-1".to_string()),
                 EntityKey::Event("event-3".to_string()),
                 EntityKey::Event("event-1".to_string())
             ]
@@ -2262,7 +2334,20 @@ mod tests {
     }
 
     #[test]
-    fn help_overlay_and_split_render_include_real_context() {
+    fn fullscreen_detail_hides_workspace_chrome() {
+        let mut app = app();
+        seed(&mut app);
+        app.tab_state_mut(Tab::Events).selected = Some(EntityKey::Event("event-3".to_string()));
+        app.open_detail();
+
+        let rendered = render_string(&app).expect("rendered");
+        assert!(rendered.contains("Event Detail"));
+        assert!(!rendered.contains("OpenClaw Logpulse"));
+        assert!(!rendered.contains("Toggle contextual help"));
+    }
+
+    #[test]
+    fn help_overlay_scroll_keys_change_help_view() {
         let mut test_app = app();
         seed(&mut test_app);
         test_app.help_open = true;
@@ -2273,6 +2358,15 @@ mod tests {
         assert!(rendered.contains("Enter"));
         assert!(rendered.contains("Toggle contextual help"));
 
+        let before_scroll = render_string(&test_app).expect("before scroll");
+        assert_eq!(test_app.help_scroll, 0);
+        assert!(!perform_action(&mut test_app, Action::ScrollDown));
+        assert_eq!(test_app.help_scroll, 1);
+        assert!(!perform_action(&mut test_app, Action::ScrollDown));
+        assert_eq!(test_app.help_scroll, 2);
+        let after_scroll = render_string(&test_app).expect("after scroll");
+        assert_ne!(before_scroll, after_scroll);
+
         let binding = resolve_action(
             &App {
                 help_open: false,
@@ -2281,5 +2375,31 @@ mod tests {
             &KeyEvent::from(KeyCode::Char('?')),
         );
         assert_eq!(binding, Some(Action::ToggleHelp));
+    }
+
+    #[test]
+    fn drilldown_events_keep_in_scope_stale_notices() {
+        let mut app = app();
+        seed(&mut app);
+
+        app.switch_tab(Tab::Calls);
+        app.tab_state_mut(Tab::Calls).scope = DrilldownScope {
+            session_id: Some("session-a".to_string()),
+            call_entity_id: None,
+        };
+        app.tab_state_mut(Tab::Calls).selected =
+            Some(EntityKey::Call("session-a:call-1".to_string()));
+        app.activate_selected();
+
+        let event_rows = app.visible_rows(Tab::Events);
+        assert!(event_rows
+            .iter()
+            .any(|row| row.key == EntityKey::Notice("notice-1".to_string())));
+
+        app.tab_state_mut(Tab::Events).scope.call_entity_id = Some("session-a:call-1".to_string());
+        let call_scoped_rows = app.visible_rows(Tab::Events);
+        assert!(call_scoped_rows
+            .iter()
+            .any(|row| row.key == EntityKey::Notice("notice-1".to_string())));
     }
 }
