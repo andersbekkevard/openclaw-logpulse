@@ -1,6 +1,6 @@
-# openclaw-logpulse
+# logpulse
 
-openclaw-logpulse gives you a fast CLI for live OpenClaw log observation focused on tool-call lifecycle visibility.
+logpulse gives you a fast CLI for live OpenClaw log observation focused on tool-call lifecycle visibility.
 
 By default, it now launches a color TUI dashboard for humans. If stdout is not a terminal, it automatically falls back to line-oriented human output so pipes and scripts still behave.
 
@@ -16,22 +16,6 @@ cargo install --path .
 
 ```bash
 echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-If you want a shorter shell alias:
-
-```bash
-echo 'alias logpulse="openclaw-logpulse"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-If you want `logpulse` as a real command name instead of a shell alias:
-
-```bash
-mkdir -p ~/.local/bin
-ln -sf ~/.cargo/bin/openclaw-logpulse ~/.local/bin/logpulse
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -51,29 +35,29 @@ Use `--force` so the installed binary is replaced even when the package version 
 
 ```bash
 # Default: launch the interactive TUI (auto-discovers OpenClaw session logs)
-openclaw-logpulse
+logpulse
 
 # Follow from beginning of discovered source in the TUI
-openclaw-logpulse --from-start
+logpulse --from-start
 
 # Filter the TUI by session, agent, and tool
-openclaw-logpulse --session "session-12" --agent "agent-7" --tool shell
+logpulse --session "session-12" --agent "agent-7" --tool shell
 
 # Force line-oriented human output
-openclaw-logpulse --format human
+logpulse --format human
 
 # JSON output for machine ingestion
-openclaw-logpulse --format json
+logpulse --format json
 
 # One-line with explicit log file path
-openclaw-logpulse /var/log/openclaw.log
+logpulse /var/log/openclaw.log
 
 # Optional time window + heartbeat/stale controls
-openclaw-logpulse --since 2026-01-01T12:00:00Z --until 2026-01-02T12:00:00Z \
+logpulse --since 2026-01-01T12:00:00Z --until 2026-01-02T12:00:00Z \
   --stale-seconds 20 --heartbeat-seconds 5
 
 # One-shot parse (no follow)
-openclaw-logpulse --no-follow
+logpulse --no-follow
 ```
 
 ### Arguments
@@ -120,7 +104,7 @@ Auto-discovery checks these sources, in order:
 
 ## Troubleshooting
 
-- If auto-discovery fails, pass a log path directly and confirm permissions: `openclaw-logpulse <LOG_FILE>`.
+- If auto-discovery fails, pass a log path directly and confirm permissions: `logpulse <LOG_FILE>`.
 - If malformed lines dominate, check that the log source format changed; non-JSON lines are preserved as MALFORMED events.
 - If stale warnings flood, verify tool call completion markers are present in the log (`...tool_call_result...` or structured result fields).
 - If heartbeat never appears, verify events are being emitted and/or inspect no-follow mode behavior.

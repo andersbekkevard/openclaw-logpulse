@@ -1,0 +1,101 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>logpulse demo</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    background: linear-gradient(180deg, #0b1020 0%, #111827 100%);
+    font-family: Inter, system-ui, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 28px;
+    box-sizing: border-box;
+  }
+  .frame {
+    width: fit-content;
+    max-width: 100%;
+    border-radius: 18px;
+    overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,.45);
+    border: 1px solid rgba(148,163,184,.22);
+    background: #0b1220;
+  }
+  .bar {
+    height: 46px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 16px;
+    background: #1f2937;
+    color: #e5e7eb;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .dot { width: 12px; height: 12px; border-radius: 999px; }
+  .red { background: #ff5f57; }
+  .yellow { background: #febc2e; }
+  .green { background: #28c840; }
+  pre {
+    margin: 0;
+    padding: 18px 22px 22px;
+    color: #d1d5db;
+    background: #0b1220;
+    font: 16px/1.25 "DejaVu Sans Mono", "Liberation Mono", Menlo, Consolas, monospace;
+    white-space: pre;
+  }
+</style>
+</head>
+<body>
+  <div class="frame">
+    <div class="bar">
+      <span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span>
+      <span style="margin-left:8px">openclaw-logpulse demo</span>
+    </div>
+    <pre>┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│OpenClaw Logpulse  Events                                                                                             │
+│ Events [LIVE]  Tool Calls [LIVE]  Sessions [LIVE]                                                                    │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌Events──────────────────────────────────────────────────────────────────┐┌Inspector───────────────────────────────────┐
+│  time    kind     session agent   tool     status  preview             ││STALE WARNING                               │
+│▶ 15:49:4 STALE    alpha-0 -       http     107379s Long-running call   ││Seen: 2026-03-07T15:49:44.827429090+00:00   │
+│  15:49:4 STALE    beta-00 -       search   107383s Long-running call   ││Session: alpha-001                          │
+│  15:49:4 STALE    alpha-0 -       shell    107384s Long-running call   ││Tool: http                                  │
+│  10:00:0 START    alpha-0 -       http     started -                   ││Call ID: c-a2                               │
+│  10:00:0 RESULT   beta-00 -       search   ok      -                   ││Age: 107379 seconds                         │
+│  10:00:0 RESULT   alpha-0 -       shell    ok      -                   ││Message: Long-running tool call             │
+│  10:00:0 START    beta-00 -       search   started -                   ││                                            │
+│  10:00:0 START    alpha-0 -       shell    started -                   ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+└────────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</pre>
+  </div>
+</body>
+</html>

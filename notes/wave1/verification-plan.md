@@ -2,7 +2,7 @@
 
 Date: 2026-03-06
 Repo: /home/anders/.openclaw/workspace/dev/openclaw-logpulse
-Goal: strict, command-driven checks proving `openclaw-logpulse` behavior across all sessions.
+Goal: strict, command-driven checks proving `logpulse` behavior across all sessions.
 
 ## 1) Tier-1 checks: dynamic source discovery + live streaming
 
@@ -250,7 +250,7 @@ INPUT=notes/wave1/fixtures/synthetic/openclaw-wave1.synthetic.ndjson
 OUT=notes/wave1/artifacts/perf/startup.out
 
 start_ms=$(date +%s%3N)
-openclaw-logpulse --no-follow --format json "$INPUT" | head -n 1 > /tmp/startup_first_line.txt
+logpulse --no-follow --format json "$INPUT" | head -n 1 > /tmp/startup_first_line.txt
 end_ms=$(date +%s%3N)
 echo "$((end_ms-start_ms))" > "$OUT"
 ```
@@ -278,7 +278,7 @@ autofill(){
 autofill &
 writer=$!
 
-/usr/bin/time -v timeout 20s openclaw-logpulse --heartbeat-seconds 2 --format json --from-start "$log" > notes/wave1/artifacts/perf/memory.out 2> notes/wave1/artifacts/perf/memory.time
+/usr/bin/time -v timeout 20s logpulse --heartbeat-seconds 2 --format json --from-start "$log" > notes/wave1/artifacts/perf/memory.out 2> notes/wave1/artifacts/perf/memory.time
 kill $writer || true
 ```
 
@@ -312,7 +312,7 @@ cat > notes/wave1/fixtures/stale-case.jsonl <<'LOG'
 {"event":"tool_call_result","session_key":"session-stale-a","call_id":"stale-1","status":"ok","timestamp":"2026-03-06T10:00:20Z","level":"info"}
 LOG
 
-openclaw-logpulse --stale-seconds 1 --heartbeat-seconds 2 --format json --no-follow \
+logpulse --stale-seconds 1 --heartbeat-seconds 2 --format json --no-follow \
   notes/wave1/fixtures/stale-case.jsonl > notes/wave1/artifacts/stale/stale.out
 
 jq -s 'map(select(.kind=="stale_warning" and .call_id=="stale-1")) | length >= 1' notes/wave1/artifacts/stale/stale.out
@@ -324,7 +324,7 @@ jq -s 'map(select(.kind=="heartbeat")) | length > 0' notes/wave1/artifacts/stale
 
 ```bash
 cd /home/anders/.openclaw/workspace/dev/openclaw-logpulse
-openclaw-logpulse --stale-seconds 2 --heartbeat-seconds 1 --format json notes/wave1/fixtures/synthetic/openclaw-wave1.synthetic.ndjson \
+logpulse --stale-seconds 2 --heartbeat-seconds 1 --format json notes/wave1/fixtures/synthetic/openclaw-wave1.synthetic.ndjson \
   > notes/wave1/artifacts/stale/cross-session-heartbeat.out
 
 jq -s 'all(map(select(.kind=="heartbeat") | .active_calls | numbers) ) and all(map(select(.kind=="heartbeat") | .active_sessions | numbers))' notes/wave1/artifacts/stale/cross-session-heartbeat.out

@@ -1,0 +1,174 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>logpulse collage</title>
+<style>
+:root { color-scheme: dark; }
+body { margin:0; background:linear-gradient(180deg,#0b1020 0%,#111827 100%); font-family:Inter,system-ui,sans-serif; min-height:100vh; padding:24px; box-sizing:border-box; }
+.frame { width:fit-content; max-width:100%; border-radius:18px; overflow:hidden; box-shadow:0 20px 60px rgba(0,0,0,.45); border:1px solid rgba(148,163,184,.22); background:#0b1220; }
+.bar { height:46px; display:flex; align-items:center; gap:10px; padding:0 16px; background:#1f2937; color:#e5e7eb; font-size:14px; font-weight:600; }
+.dot { width:12px; height:12px; border-radius:999px; } .red{background:#ff5f57} .yellow{background:#febc2e} .green{background:#28c840}
+pre { margin:0; padding:18px 22px 22px; color:#d1d5db; background:#0b1220; font:12px/1.18 "DejaVu Sans Mono","Liberation Mono",Menlo,Consolas,monospace; white-space:pre; overflow:auto; }
+.grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; max-width:1800px; margin:0 auto; }
+.cardtitle { color:#cbd5e1; font:600 15px Inter,system-ui,sans-serif; padding:0 0 8px 4px; }
+.hero { color:#e5e7eb; font:700 22px Inter,system-ui,sans-serif; max-width:1800px; margin:0 auto 18px; }
+.sub { color:#94a3b8; font:500 14px Inter,system-ui,sans-serif; margin-top:4px; }
+@media (max-width: 1100px) { .grid { grid-template-columns:1fr; } pre { font-size:13px; } }
+</style></head><body><div class="hero">openclaw-logpulse demo<div class="sub">Events, Correlated Tool Calls, Sessions, and fullscreen detail</div></div><div class="grid"><div><div class="cardtitle">Events</div><div class="frame"><div class="bar"><span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span><span style="margin-left:8px">Events</span></div><pre>┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│OpenClaw Logpulse  Events                                                                                             │
+│ Events [LIVE]  Tool Calls [LIVE]  Sessions [LIVE]                                                                    │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌Events──────────────────────────────────────────────────────────────────┐┌Inspector───────────────────────────────────┐
+│  time    kind     session agent   tool     status  preview             ││STALE WARNING                               │
+│▶ 15:56:4 STALE    alpha-0 -       http     107802s Long-running call   ││Seen: 2026-03-07T15:56:47.703359531+00:00   │
+│  15:56:4 STALE    beta-00 -       search   107806s Long-running call   ││Session: alpha-001                          │
+│  15:56:4 STALE    alpha-0 -       shell    107807s Long-running call   ││Tool: http                                  │
+│  10:00:0 START    alpha-0 -       http     started -                   ││Call ID: c-a2                               │
+│  10:00:0 RESULT   beta-00 -       search   ok      -                   ││Age: 107802 seconds                         │
+│  10:00:0 RESULT   alpha-0 -       shell    ok      -                   ││Message: Long-running tool call             │
+│  10:00:0 START    beta-00 -       search   started -                   ││                                            │
+│  10:00:0 START    alpha-0 -       shell    started -                   ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+└────────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+</pre></div></div><div><div class="cardtitle">Tool Calls</div><div class="frame"><div class="bar"><span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span><span style="margin-left:8px">Tool Calls</span></div><pre>┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│OpenClaw Logpulse  Correlated Tool Calls                                                                              │
+│ Events [LIVE]  Tool Calls [LIVE]  Sessions [LIVE]                                                                    │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌Correlated Tool Calls───────────────────────────────────────────────────┐┌Inspector───────────────────────────────────┐
+│  time    status   session agent   tool     duratio preview             ││CALL http                                   │
+│▶ 10:00:0 stale    alpha-0 -       http     -       -                   ││Entity ID: session-mixed.fixture:c-a2       │
+│  10:00:0 succeede beta-00 -       search   3000ms  -                   ││Session: alpha-001                          │
+│  10:00:0 succeede alpha-0 -       shell    2000ms  -                   ││Status: stale                               │
+│                                                                        ││Confidence: explicit_id                     │
+│                                                                        ││Call ID: c-a2                               │
+│                                                                        ││Started: 2026-03-06T10:00:05+00:00          │
+│                                                                        ││Ended: -                                    │
+│                                                                        ││Duration: -                                 │
+│                                                                        ││Preview: -                                  │
+│                                                                        ││Event refs: start=1 result=0 related=0      │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+└────────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+</pre></div></div><div><div class="cardtitle">Sessions</div><div class="frame"><div class="bar"><span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span><span style="margin-left:8px">Sessions</span></div><pre>┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│OpenClaw Logpulse  Sessions                                                                                           │
+│ Events [LIVE]  Tool Calls [LIVE]  Sessions [LIVE]                                                                    │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌Sessions────────────────────────────────────────────────────────────────┐┌Inspector───────────────────────────────────┐
+│  time     session   agent      health    open      stale      level    ││SESSION                                     │
+│▶ 10:00:05 alpha-001 -          stale     1         1          warn     ││Session ID: session-mixed.fixture           │
+│                                                                        ││Label: alpha-001                            │
+│                                                                        ││Agent: -                                    │
+│                                                                        ││Last activity: 2026-03-06T10:00:05+00:00    │
+│                                                                        ││Last event: 2026-03-06T10:00:05+00:00       │
+│                                                                        ││Last source seen:                           │
+│                                                                        ││2026-03-07T15:56:47.703359531+00:00         │
+│                                                                        ││Health: stale                               │
+│                                                                        ││Open calls: 1                               │
+│                                                                        ││Stale calls: 1                              │
+│                                                                        ││Severity: warn                              │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+│                                                                        ││                                            │
+└────────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+</pre></div></div><div><div class="cardtitle">Fullscreen Detail</div><div class="frame"><div class="bar"><span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span><span style="margin-left:8px">Fullscreen Detail</span></div><pre>┌Event Detail──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│STALE WARNING                                                                                                         │
+│Seen: 2026-03-07T15:56:47.703359531+00:00                                                                             │
+│Session: alpha-001                                                                                                    │
+│Tool: http                                                                                                            │
+│Call ID: c-a2                                                                                                         │
+│Age: 107802 seconds                                                                                                   │
+│Message: Long-running tool call                                                                                       │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+</pre></div></div></div></body></html>

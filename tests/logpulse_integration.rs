@@ -19,13 +19,13 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn binary_path() -> PathBuf {
-    env::var("CARGO_BIN_EXE_openclaw_logpulse")
+    env::var("CARGO_BIN_EXE_logpulse")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             project_root()
                 .join("target")
                 .join("debug")
-                .join("openclaw-logpulse")
+                .join("logpulse")
         })
 }
 
@@ -41,7 +41,7 @@ impl TempDir {
             .expect("system clock")
             .as_nanos();
         let marker = format!(
-            "openclaw-logpulse-tests-{}-{}-{}",
+            "logpulse-tests-{}-{}-{}",
             prefix,
             std::process::id(),
             epoch_nanos
@@ -81,7 +81,7 @@ fn run_cli_with_env(args: &[&str], envs: &[(&str, &str)]) -> (String, String, i3
         .args(args)
         .envs(envs.iter().map(|(k, v)| (*k, *v)))
         .output()
-        .expect("run openclaw-logpulse");
+        .expect("run logpulse");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let status = output.status.code().unwrap_or(1);

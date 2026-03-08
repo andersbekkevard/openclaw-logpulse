@@ -1,0 +1,44 @@
+┌──────────────────────────────────────────────────────────────────┐
+│OpenClaw Logpulse  Events                                         │
+│ Events [LIVE]  Tool Calls [LIVE]  Sessions [LIVE]                │
+└──────────────────────────────────────────────────────────────────┘
+┌Events────────────────────────────────────────────────────────────┐
+│  time   kind    sessio agent  tool    status preview             │
+│▶ 16:05: STALE   alpha- -      http    108338 Long-running call   │
+│  16:05: STALE   beta-0 -      search  108342 Long-running call   │
+│  16:05: STALE   alpha- -      shell   108343 Long-running call   │
+│  10:00: START   alpha- -      http    starte -                   │
+│  10:00: RESULT  beta-0 -      search  ok     -                   │
+│  10:00: RESULT  alpha- -      shell   ok     -                   │
+│  10:00: START   beta-0 -      search  starte -                   │
+│  10:00: START   alpha- -      shell   starte -                   │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+┌Inspector─────────────────────────────────────────────────────────┐
+│STALE WARNING                                                     │
+│Seen: 2026-03-07T16:05:43.363409408+00:00                         │
+│Session: alpha-001                                                │
+│Tool: http                                                        │
+│Call ID: c-a2                                                     │
+│Age: 108338 seconds                                               │
+│Message: Long-running tool call                                   │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+└──────────────────────────────────────────────────────────────────┘

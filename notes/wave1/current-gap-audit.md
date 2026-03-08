@@ -63,7 +63,7 @@ Current implementation is a single-file tailer CLI. The executable requires an e
    - Add explicit error path and exit behavior for unresolved log source.
 
 3. Update `README.md` usage:
-   - Add `openclaw-logpulse` no-arg example.
+   - Add `logpulse` no-arg example.
    - Document fallback resolution and required one-line behavior.
 
 ### Wave 2 (dynamic multi-file stream)

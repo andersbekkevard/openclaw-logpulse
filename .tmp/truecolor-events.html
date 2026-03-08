@@ -1,0 +1,52 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>logpulse true-color events</title>
+<style>
+:root{color-scheme:dark} body{margin:0;background:linear-gradient(180deg,#0b1020 0%,#111827 100%);font-family:Inter,system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box}
+.frame{width:min(100%,430px);border-radius:18px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.45);border:1px solid rgba(148,163,184,.22);background:#0b1220}
+.bar{height:44px;display:flex;align-items:center;gap:10px;padding:0 14px;background:#1f2937;color:#e5e7eb;font-size:14px;font-weight:600}
+.dot{width:11px;height:11px;border-radius:999px} .red{background:#ff5f57} .yellow{background:#febc2e} .green{background:#28c840}
+pre{margin:0;padding:14px 16px 18px;color:#d1d5db;background:#0b1220;font:9px/1.18 "DejaVu Sans Mono","Liberation Mono",Menlo,Consolas,monospace;white-space:pre;overflow:hidden}
+</style></head><body><div class="frame"><div class="bar"><span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span><span style="margin-left:8px">logpulse true-color events</span></div><pre>┌──────────────────────────────────────────────────────────────────┐
+│<span style="color:#008080;font-weight:700">OpenClaw Logpulse</span>  <span style="color:#ffffff">Events</span>                                         │
+│<span style="color:#000000;background:#008080;font-weight:700"> Events [LIVE] </span><span style="color:#c0c0c0"> Tool Calls [LIVE]  Sessions [LIVE] </span>               │
+└──────────────────────────────────────────────────────────────────┘
+┌Events────────────────────────────────────────────────────────────┐
+│<span style="font-weight:700">  time   kind    sessio agent  tool    status preview             </span>│
+│<span style="background:#232b3c;font-weight:700">▶ 16:18: STALE   alpha- -      http    109111 Long-running call   </span>│
+│  16:18: STALE   beta-0 -      search  109115 Long-running call   │
+│  16:18: STALE   alpha- -      shell   109116 Long-running call   │
+│  10:00: START   alpha- -      http    starte -                   │
+│  10:00: RESULT  beta-0 -      search  ok     -                   │
+│  10:00: RESULT  alpha- -      shell   ok     -                   │
+│  10:00: START   beta-0 -      search  starte -                   │
+│  10:00: START   alpha- -      shell   starte -                   │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+┌Inspector─────────────────────────────────────────────────────────┐
+│<span style="color:#808000;font-weight:700">STALE WARNING</span>                                                     │
+│<span style="color:#808000;font-weight:700">Seen: </span>2026-03-07T16:18:36.004604486+00:00                         │
+│<span style="color:#808000;font-weight:700">Session: </span>alpha-001                                                │
+│<span style="color:#808000;font-weight:700">Tool: </span>http                                                        │
+│<span style="color:#808000;font-weight:700">Call ID: </span>c-a2                                                     │
+│<span style="color:#808000;font-weight:700">Age: </span>109111 seconds                                               │
+│<span style="color:#808000;font-weight:700">Message: </span>Long-running tool call                                   │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+└──────────────────────────────────────────────────────────────────┘
+</pre></div></body></html>

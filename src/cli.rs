@@ -30,7 +30,7 @@ impl LevelArg {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "openclaw-logpulse",
+    name = "logpulse",
     version,
     about = "Live visibility for OpenClaw tool calls"
 )]

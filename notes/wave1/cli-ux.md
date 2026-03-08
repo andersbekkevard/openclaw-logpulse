@@ -8,7 +8,7 @@ Provide a zero-argument default workflow for common on-call and ops usage while 
 ### Top-level command
 
 ```bash
-openclaw-logpulse [OPTIONS] [LOG_PATH]
+logpulse [OPTIONS] [LOG_PATH]
 ```
 
 ### Zero-arg behavior
@@ -38,7 +38,7 @@ If none are available, print a concise diagnostic and exit with usage help plus 
 
 ```text
 USAGE:
-  openclaw-logpulse [OPTIONS] [LOG_PATH]
+  logpulse [OPTIONS] [LOG_PATH]
 
 OPTIONS:
   --from-start                 Read from beginning of file instead of tail position
@@ -272,37 +272,37 @@ When streaming, objects are emitted in event time order with heartbeat/stats aft
 ### Follow global stream with zero args (default log path)
 
 ```bash
-openclaw-logpulse
+logpulse
 ```
 
 ### Follow from standard start with strict severity filter
 
 ```bash
-openclaw-logpulse --from-start --severity error --format human
+logpulse --from-start --severity error --format human
 ```
 
 ### Track one session and one tool for last 20m only
 
 ```bash
-openclaw-logpulse --session 9b1a2c --tool shell.exec --window 20m
+logpulse --session 9b1a2c --tool shell.exec --window 20m
 ```
 
 ### JSON for SIEM ingestion with one-off parse
 
 ```bash
-openclaw-logpulse --no-follow --format json --since 2026-03-06T00:00:00Z /var/log/openclaw/openclaw.log
+logpulse --no-follow --format json --since 2026-03-06T00:00:00Z /var/log/openclaw/openclaw.log
 ```
 
 ### Stale action monitoring with stats heartbeat
 
 ```bash
-openclaw-logpulse --stale-seconds 45 --stale-interval 15 --heartbeat 10 --stats
+logpulse --stale-seconds 45 --stale-interval 15 --heartbeat 10 --stats
 ```
 
 ### Multi-filter command for on-call triage
 
 ```bash
-openclaw-logpulse \
+logpulse \
   --session checkout \
   --agent agent:worker-3 \
   --tool kubernetes \
@@ -314,5 +314,5 @@ openclaw-logpulse \
 ### One-shot health slice (past hour), JSON pretty for review
 
 ```bash
-openclaw-logpulse --no-follow --window 1h --json-pretty
+logpulse --no-follow --window 1h --json-pretty
 ```
