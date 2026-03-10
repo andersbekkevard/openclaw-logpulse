@@ -1,11 +1,13 @@
 use crate::event::{NormalizedEvent, Severity, ToolEventKind};
 use crate::parser::ParsedLine;
 use crate::session_identity::{
-    build_session_identity, derive_routing_metadata, SessionIdentityState,
+    build_session_identity, derive_routing_metadata, merge_routing_metadata, SessionIdentityState,
+    SessionRoutingMetadata,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::fs;
 use std::path::Path;
 
 const MAX_PARAM_VALUE_LENGTH: usize = 120;
@@ -281,7 +283,7 @@ fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> Vec<N
 
     let source_context = SourceContext::from_path(source_path);
 
-    let transcript_events = normalize_transcript_event(raw, value, &source_context);
+    let transcript_events = normalize_transcript_event(raw, value, source_path, &source_context);
     if !transcript_events.is_empty() {
         return transcript_events;
     }
@@ -303,7 +305,10 @@ fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> Vec<N
         session_key.as_deref(),
         payload_session_label.as_deref(),
     );
-    let routing = derive_routing_metadata(value, session_key.as_deref());
+    let routing = merge_routing_metadata(
+        derive_routing_metadata(value, session_key.as_deref()),
+        source_manifest_routing(source_path, source_context.session_id.as_deref()).as_ref(),
+    );
 
     let agent_id = first_string_from_paths(value, AGENT_PATHS).or(source_context.agent_id.clone());
     let tool_name = first_string_from_paths(value, TOOL_PATHS);
@@ -407,13 +412,17 @@ fn session_id_from_file_name(file_name: &str) -> Option<String> {
 fn normalize_transcript_event(
     raw: &str,
     value: &Value,
+    source_path: Option<&Path>,
     source_context: &SourceContext,
 ) -> Vec<NormalizedEvent> {
     let Some(entry_type) = value.get("type").and_then(Value::as_str) else {
         return Vec::new();
     };
     let (timestamp, timestamp_raw) = parse_timestamp(value);
-    let routing = derive_routing_metadata(value, None);
+    let routing = merge_routing_metadata(
+        derive_routing_metadata(value, None),
+        source_manifest_routing(source_path, source_context.session_id.as_deref()).as_ref(),
+    );
     let session_identity = if entry_type == "session" {
         build_session_identity(
             value
@@ -473,6 +482,29 @@ fn normalize_transcript_event(
         ),
         _ => Vec::new(),
     }
+}
+
+fn source_manifest_routing(
+    source_path: Option<&Path>,
+    session_id: Option<&str>,
+) -> Option<SessionRoutingMetadata> {
+    let session_id = session_id?;
+    let manifest_path = source_path?.parent()?.join("sessions.json");
+    let manifest = fs::read_to_string(manifest_path).ok()?;
+    let manifest = serde_json::from_str::<Value>(&manifest).ok()?;
+    let entries = manifest.as_object()?;
+
+    entries.values().find_map(|entry| {
+        let manifest_session_id = entry
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .or_else(|| entry.get("session_id").and_then(Value::as_str));
+        if manifest_session_id == Some(session_id) {
+            Some(derive_routing_metadata(entry, None))
+        } else {
+            None
+        }
+    })
 }
 
 fn normalize_transcript_message(
@@ -1039,7 +1071,31 @@ fn truncate(text: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{normalize, normalize_many_with_source, normalize_with_source};
+    use std::fs;
     use std::path::Path;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_session_fixture(session_id: &str, manifest: &str) -> (PathBuf, Box<dyn FnOnce()>) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("logpulse-normalizer-{unique}"));
+        let sessions_dir = root.join("agents").join("main").join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_path = sessions_dir.join(format!("{session_id}.jsonl"));
+        fs::write(&session_path, "").expect("write session file");
+        fs::write(sessions_dir.join("sessions.json"), manifest).expect("write sessions manifest");
+
+        let cleanup_root = root.clone();
+        (
+            session_path,
+            Box::new(move || {
+                let _ = fs::remove_dir_all(cleanup_root);
+            }),
+        )
+    }
 
     #[test]
     fn parse_tool_call_from_json() {
@@ -1247,5 +1303,40 @@ mod tests {
             Some("metadata.channel_id")
         );
         assert!(normalized.routing.issues.is_empty());
+    }
+
+    #[test]
+    fn transcript_normalization_uses_session_manifest_routing_when_payload_is_silent() {
+        let session_id = "b18666a8-b5d5-4e92-a7a3-a2d1e72ac6f8";
+        let (session_path, cleanup) = write_session_fixture(
+            session_id,
+            r#"{
+  "agent:main:main": {
+    "sessionId": "b18666a8-b5d5-4e92-a7a3-a2d1e72ac6f8",
+    "deliveryContext": {
+      "channel": "discord",
+      "to": "channel:1477636729950179490"
+    },
+    "origin": {
+      "provider": "discord",
+      "to": "channel:1477636729950179490"
+    }
+  }
+}"#,
+        );
+        let line = r#"{"type":"message","id":"60167cca","parentId":"1f5ac5f2","timestamp":"2026-03-07T09:31:19.656Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_a","name":"read","arguments":{"file_path":"/tmp/a"}}],"stopReason":"toolUse","timestamp":1772875879655}}"#;
+        let normalized = normalize_with_source(line, Some(&session_path));
+
+        assert_eq!(normalized.routing.provider.as_deref(), Some("discord"));
+        assert_eq!(
+            normalized.routing.channel_id.as_deref(),
+            Some("1477636729950179490")
+        );
+        assert_eq!(
+            normalized.routing.channel_id_source.as_deref(),
+            Some("deliveryContext.to")
+        );
+
+        cleanup();
     }
 }

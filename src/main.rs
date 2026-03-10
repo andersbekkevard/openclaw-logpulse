@@ -1,4 +1,5 @@
 mod cli;
+mod discord;
 mod discovery;
 mod event;
 mod model;
@@ -6,9 +7,8 @@ mod normalizer;
 mod output;
 mod parser;
 mod projection;
-mod discord;
-mod session_label;
 mod session_identity;
+mod session_label;
 mod stale;
 mod tailer;
 mod tui;

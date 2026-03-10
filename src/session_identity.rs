@@ -106,6 +106,12 @@ pub fn derive_routing_metadata(value: &Value, session_key: Option<&str>) -> Sess
         &mut channel_candidates,
         &mut issues,
     );
+    collect_session_manifest_candidates(
+        value,
+        &mut provider_candidates,
+        &mut channel_candidates,
+        &mut issues,
+    );
 
     if let Some(session_key) = session_key {
         if session_key_mentions_discord(session_key) {
@@ -137,6 +143,47 @@ pub fn derive_routing_metadata(value: &Value, session_key: Option<&str>) -> Sess
     }
 
     routing
+}
+
+pub fn merge_routing_metadata(
+    mut primary: SessionRoutingMetadata,
+    fallback: Option<&SessionRoutingMetadata>,
+) -> SessionRoutingMetadata {
+    let Some(fallback) = fallback else {
+        return primary;
+    };
+
+    let provider_has_conflict = primary
+        .issues
+        .iter()
+        .any(|issue| issue.field == "provider" && issue.kind == RoutingIssueKind::Conflict);
+    if primary.provider.is_none() && !provider_has_conflict {
+        primary.provider = fallback.provider.clone();
+        primary.provider_source = fallback.provider_source.clone();
+    }
+
+    let channel_has_conflict = primary
+        .issues
+        .iter()
+        .any(|issue| issue.field == "channel_id" && issue.kind == RoutingIssueKind::Conflict);
+    if primary.channel_id.is_none() && !channel_has_conflict {
+        primary.channel_id = fallback.channel_id.clone();
+        primary.channel_id_source = fallback.channel_id_source.clone();
+    }
+
+    if primary.issues.is_empty() {
+        primary.issues = fallback.issues.clone();
+    } else if !fallback.issues.is_empty() {
+        primary.issues.extend(fallback.issues.clone());
+    }
+
+    if primary.is_discord() && primary.channel_id.is_some() {
+        primary.issues.retain(|issue| {
+            !(issue.kind == RoutingIssueKind::Missing && issue.field == "channel_id")
+        });
+    }
+
+    primary
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -362,6 +409,46 @@ fn collect_transcript_discord_candidates(
     }
 }
 
+fn collect_session_manifest_candidates(
+    value: &Value,
+    provider_candidates: &mut Vec<Candidate>,
+    channel_candidates: &mut Vec<Candidate>,
+    issues: &mut Vec<SessionRoutingIssue>,
+) {
+    if let Some(provider) = get_value_by_path(value, &["deliveryContext", "channel"]) {
+        let source = "deliveryContext.channel";
+        if let Some(channel) = value_to_string(provider) {
+            let channel = channel.trim();
+            if !channel.is_empty() {
+                provider_candidates.push(Candidate::new(channel.to_ascii_lowercase(), source));
+            }
+        }
+    }
+
+    if let Some(provider) = get_value_by_path(value, &["origin", "provider"]) {
+        let source = "origin.provider";
+        if let Some(provider) = value_to_string(provider) {
+            let provider = provider.trim();
+            if !provider.is_empty() {
+                provider_candidates.push(Candidate::new(provider.to_ascii_lowercase(), source));
+            }
+        }
+    }
+
+    collect_channel_reference_candidate(
+        get_value_by_path(value, &["deliveryContext", "to"]),
+        "deliveryContext.to",
+        channel_candidates,
+        issues,
+    );
+    collect_channel_reference_candidate(
+        get_value_by_path(value, &["origin", "to"]),
+        "origin.to",
+        channel_candidates,
+        issues,
+    );
+}
+
 fn collect_channel_candidate(
     raw_value: Option<&Value>,
     source: &str,
@@ -371,6 +458,37 @@ fn collect_channel_candidate(
     let Some(raw) = raw_value.and_then(value_to_string) else {
         return;
     };
+    collect_channel_candidate_from_raw(&raw, source, channel_candidates, issues);
+}
+
+fn collect_channel_reference_candidate(
+    raw_value: Option<&Value>,
+    source: &str,
+    channel_candidates: &mut Vec<Candidate>,
+    issues: &mut Vec<SessionRoutingIssue>,
+) {
+    let Some(raw) = raw_value.and_then(value_to_string) else {
+        return;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return;
+    }
+
+    if let Some(channel_id) = raw.strip_prefix("channel:") {
+        collect_channel_candidate_from_raw(channel_id, source, channel_candidates, issues);
+        return;
+    }
+
+    collect_channel_candidate_from_raw(raw, source, channel_candidates, issues);
+}
+
+fn collect_channel_candidate_from_raw(
+    raw: &str,
+    source: &str,
+    channel_candidates: &mut Vec<Candidate>,
+    issues: &mut Vec<SessionRoutingIssue>,
+) {
     let raw = raw.trim();
     if raw.is_empty() {
         return;
@@ -607,6 +725,32 @@ mod tests {
         assert_eq!(
             routing.channel_id_source.as_deref(),
             Some("message.details.result.channelId")
+        );
+        assert!(routing.issues.is_empty());
+    }
+
+    #[test]
+    fn derives_discord_routing_from_session_manifest_entry() {
+        let routing = derive_routing_metadata(
+            &json!({
+                "sessionId": "b18666a8-b5d5-4e92-a7a3-a2d1e72ac6f8",
+                "deliveryContext": {
+                    "channel": "discord",
+                    "to": "channel:1477636729950179490"
+                },
+                "origin": {
+                    "provider": "discord",
+                    "to": "channel:1477636729950179490"
+                }
+            }),
+            None,
+        );
+
+        assert_eq!(routing.provider.as_deref(), Some("discord"));
+        assert_eq!(routing.channel_id.as_deref(), Some("1477636729950179490"));
+        assert_eq!(
+            routing.channel_id_source.as_deref(),
+            Some("deliveryContext.to")
         );
         assert!(routing.issues.is_empty());
     }
