@@ -2,6 +2,7 @@ mod cli;
 mod discord;
 mod discovery;
 mod event;
+mod history;
 mod model;
 mod normalizer;
 mod output;
@@ -14,14 +15,14 @@ mod tailer;
 mod tui;
 
 use chrono::Utc;
-use clap::Parser;
 use std::env;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::cli::Args;
+use crate::cli::{parse_command, Args, CliCommand};
+use crate::history::clear_default_history;
 use crate::normalizer::normalize_many_with_source;
 use crate::output::{effective_mode, OutputMode};
 use crate::stale::StaleTracker;
@@ -29,7 +30,31 @@ use crate::stale::StaleTracker;
 const MISSING_TTL_SECONDS: u64 = 30;
 
 fn main() {
-    let (mut args, auto_discover) = parse_args();
+    let command = match parse_command() {
+        Ok(command) => command,
+        Err(err) => err.exit(),
+    };
+
+    if let CliCommand::TuiClear = command {
+        match clear_default_history() {
+            Ok(path) => {
+                println!("cleared persisted TUI history at {}", path.display());
+            }
+            Err(err) => {
+                eprintln!("failed to clear persisted TUI history: {err}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let CliCommand::Run {
+        mut args,
+        auto_discover,
+    } = command
+    else {
+        unreachable!("handled all CLI commands");
+    };
     args.format = effective_mode(args.format);
     let time_filter = match args.time_filter() {
         Ok(filter) => filter,
@@ -222,11 +247,4 @@ fn discover_initial_session_logs() -> Vec<PathBuf> {
         }
         None => Vec::new(),
     }
-}
-
-fn parse_args() -> (Args, bool) {
-    let args = Args::parse_from(env::args_os());
-    let use_discovery = args.log_file.is_none();
-
-    (args, use_discovery)
 }

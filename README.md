@@ -37,6 +37,9 @@ Use `--force` so the installed binary is replaced even when the package version 
 # Default: launch the interactive TUI (auto-discovers OpenClaw session logs)
 logpulse
 
+# Launch the TUI without restoring persisted history for this run
+logpulse tui --fresh
+
 # Follow from beginning of discovered source in the TUI
 logpulse --from-start
 
@@ -58,6 +61,9 @@ logpulse --since 2026-01-01T12:00:00Z --until 2026-01-02T12:00:00Z \
 
 # One-shot parse (no follow)
 logpulse --no-follow
+
+# Delete the persisted TUI history store
+logpulse tui clear
 ```
 
 ### Arguments
@@ -75,6 +81,8 @@ logpulse --no-follow
 - `--poll-millis N` file poll interval used when following.
 - `--from-start` start from file start.
 - `--no-follow` read existing content only.
+- `--fresh` skip restoring persisted TUI history for this run. `logpulse tui --fresh` is the explicit TUI form.
+- `tui clear` delete the persisted TUI history store at `~/.openclaw/logpulse/history.sqlite3`.
 
 ### TUI controls
 
@@ -85,6 +93,8 @@ logpulse --no-follow
 - `g` jump to newest event, `G` jump to oldest retained event
 
 The timeline is intentionally compact while the detail pane shows the decoded event metadata plus a pretty-printed raw payload, so you can read things like exec commands, memory queries, and tool results without staring at compressed JSON soup.
+
+The TUI restores up to the newest 10,000 normalized events from a global SQLite history store at startup before attaching to live log streams. Use `logpulse tui clear` to wipe that store; in-TUI clearing remains viewport-only and does not delete persisted history.
 
 Auto-discovery checks these sources, in order:
 

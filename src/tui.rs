@@ -1,5 +1,6 @@
 use crate::cli::Args;
 use crate::event::{NormalizedEvent, Severity, TimeFilter, ToolEventKind};
+use crate::history::PersistedHistory;
 use crate::normalizer::normalize_many_with_source;
 use crate::projection::{
     CallStatus, CorrelatedCall, EventRow, HealthConfig, HealthStatus, MatchConfidence,
@@ -1613,6 +1614,8 @@ fn run_app(
     let filters = WorkspaceFilters::from_args(args, time_filter.clone());
     let mut app = App::new(filters, args.stale_seconds);
     let mut tracker = StaleTracker::new(args.stale_seconds);
+    let mut history = PersistedHistory::open_default()?;
+    restore_history(&mut app, &mut tracker, &history, args.fresh)?;
     let heartbeat_interval = args.heartbeat_duration();
     let ui_tick = Duration::from_millis(50);
     let mut last_heartbeat = Instant::now();
@@ -1645,7 +1648,7 @@ fn run_app(
                 last_scan = now;
             }
 
-            drain_multi_tailer(&mut tailer, &mut tracker, &mut app);
+            drain_multi_tailer(&mut tailer, &mut history, &mut tracker, &mut app);
             app.refresh_session_labels(Utc::now());
             terminal.draw(|frame| render(frame, &mut app))?;
         }
@@ -1691,7 +1694,7 @@ fn run_app(
             last_heartbeat = now;
         }
 
-        drain_single_tailer(&mut tailer, &log_file, &mut tracker, &mut app);
+        drain_single_tailer(&mut tailer, &log_file, &mut history, &mut tracker, &mut app);
         app.refresh_session_labels(Utc::now());
         terminal.draw(|frame| render(frame, &mut app))?;
     }
@@ -1866,11 +1869,16 @@ fn perform_action(app: &mut App, action: Action) -> bool {
     }
 }
 
-fn drain_multi_tailer(tailer: &mut tailer::MultiTailer, tracker: &mut StaleTracker, app: &mut App) {
+fn drain_multi_tailer(
+    tailer: &mut tailer::MultiTailer,
+    history: &mut PersistedHistory,
+    tracker: &mut StaleTracker,
+    app: &mut App,
+) {
     for _ in 0..DRAIN_PER_TICK {
         match tailer.next_line() {
             Ok(Some((path, raw_line))) => {
-                ingest_line(&raw_line, Some(path.as_path()), tracker, app)
+                ingest_line(&raw_line, Some(path.as_path()), history, tracker, app)
             }
             Ok(None) => break,
             Err(err) => {
@@ -1884,12 +1892,13 @@ fn drain_multi_tailer(tailer: &mut tailer::MultiTailer, tracker: &mut StaleTrack
 fn drain_single_tailer(
     tailer: &mut tailer::Tailer,
     log_file: &Path,
+    history: &mut PersistedHistory,
     tracker: &mut StaleTracker,
     app: &mut App,
 ) {
     for _ in 0..DRAIN_PER_TICK {
         match tailer.next_line() {
-            Ok(Some(raw_line)) => ingest_line(&raw_line, Some(log_file), tracker, app),
+            Ok(Some(raw_line)) => ingest_line(&raw_line, Some(log_file), history, tracker, app),
             Ok(None) => break,
             Err(err) => {
                 app.ingest_error(err.to_string(), Utc::now());
@@ -1902,12 +1911,16 @@ fn drain_single_tailer(
 fn ingest_line(
     raw_line: &str,
     source_path: Option<&Path>,
+    history: &mut PersistedHistory,
     tracker: &mut StaleTracker,
     app: &mut App,
 ) {
     let now = Utc::now();
     for event in normalize_many_with_source(raw_line, source_path) {
         let warnings = tracker.on_event(&event, now);
+        if let Err(err) = history.append(now, &event) {
+            app.ingest_error(format!("failed to persist history: {err}"), now);
+        }
         app.ingest_event(event, now);
         for warning in warnings {
             if app.filters.time.contains(Some(now)) {
@@ -1915,6 +1928,25 @@ fn ingest_line(
             }
         }
     }
+}
+
+fn restore_history(
+    app: &mut App,
+    tracker: &mut StaleTracker,
+    history: &PersistedHistory,
+    fresh: bool,
+) -> io::Result<usize> {
+    if fresh {
+        return Ok(0);
+    }
+
+    let restored = history.load_recent()?;
+    let restored_count = restored.len();
+    for persisted in restored {
+        tracker.on_event(&persisted.event, persisted.observed_at);
+        app.ingest_event(persisted.event, persisted.observed_at);
+    }
+    Ok(restored_count)
 }
 
 fn render(frame: &mut Frame, app: &mut App) {
@@ -2384,6 +2416,9 @@ fn format_filters(args: &Args) -> String {
     } else {
         "mode=follow".to_string()
     });
+    if args.fresh {
+        parts.push("history=fresh".to_string());
+    }
 
     parts.join("  •  ")
 }
@@ -2392,6 +2427,7 @@ fn format_filters(args: &Args) -> String {
 mod tests {
     use super::*;
     use crate::discord::{DiscordLookup, DiscordLookupError};
+    use crate::history::PersistedHistory;
     use crate::normalizer::normalize_many_with_source;
     use crate::session_identity::SessionRoutingMetadata;
     use crate::session_label::SessionLabelResolver;
@@ -2680,6 +2716,16 @@ mod tests {
         )
     }
 
+    fn history_path() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("logpulse-tui-history-{unique}"))
+            .join("history.sqlite3")
+    }
+
     fn inspector_string(app: &App) -> String {
         app.inspector_text()
             .lines
@@ -2692,6 +2738,81 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn restore_history_rehydrates_persisted_events_before_live_ingest() {
+        let path = history_path();
+        let mut history = PersistedHistory::open(&path).expect("open history");
+        let first = event(
+            "session-a",
+            Some("label-a"),
+            "shell",
+            Some("call-1"),
+            ToolEventKind::ToolCallStart,
+            "2026-03-07T10:00:00Z",
+        );
+        let second = event(
+            "session-a",
+            Some("label-a"),
+            "shell",
+            Some("call-1"),
+            ToolEventKind::ToolCallResult,
+            "2026-03-07T10:00:01Z",
+        );
+        history
+            .append(first.timestamp.expect("timestamp"), &first)
+            .expect("append first");
+        history
+            .append(second.timestamp.expect("timestamp"), &second)
+            .expect("append second");
+
+        let mut app = app();
+        let mut tracker = StaleTracker::new(30);
+        let restored = restore_history(&mut app, &mut tracker, &history, false).expect("restore");
+        let event_refs = app
+            .visible_rows(Tab::Events)
+            .into_iter()
+            .filter_map(|row| match row.key {
+                EntityKey::Event(event_ref) => Some(event_ref),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(restored, 2);
+        assert_eq!(
+            event_refs,
+            vec!["event-2".to_string(), "event-1".to_string()]
+        );
+
+        fs::remove_dir_all(path.parent().expect("parent")).expect("cleanup");
+    }
+
+    #[test]
+    fn fresh_launch_skips_restore_without_clearing_persisted_history() {
+        let path = history_path();
+        let mut history = PersistedHistory::open(&path).expect("open history");
+        let saved = event(
+            "session-a",
+            Some("label-a"),
+            "shell",
+            Some("call-1"),
+            ToolEventKind::ToolCallStart,
+            "2026-03-07T10:00:00Z",
+        );
+        history
+            .append(saved.timestamp.expect("timestamp"), &saved)
+            .expect("append");
+
+        let mut app = app();
+        let mut tracker = StaleTracker::new(30);
+        let restored = restore_history(&mut app, &mut tracker, &history, true).expect("restore");
+
+        assert_eq!(restored, 0);
+        assert!(app.visible_rows(Tab::Events).is_empty());
+        assert_eq!(history.load_recent().expect("load recent").len(), 1);
+
+        fs::remove_dir_all(path.parent().expect("parent")).expect("cleanup");
     }
 
     #[test]

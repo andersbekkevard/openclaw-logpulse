@@ -1,8 +1,8 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionIdentityConflict {
     pub field: String,
     pub preferred_source: String,
@@ -11,7 +11,7 @@ pub struct SessionIdentityConflict {
     pub conflicting_value: String,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingIssueKind {
     Missing,
@@ -19,14 +19,14 @@ pub enum RoutingIssueKind {
     Malformed,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRoutingIssue {
     pub kind: RoutingIssueKind,
     pub field: String,
     pub detail: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRoutingMetadata {
     pub provider: Option<String>,
     pub provider_source: Option<String>,
