@@ -62,11 +62,7 @@ pub fn emit_tool_event(
         }
         OutputMode::Human => {
             let ts = event.timestamp.unwrap_or_else(Utc::now).to_rfc3339();
-            let session = event
-                .session_key
-                .as_ref()
-                .or(event.session_id.as_ref())
-                .map_or("-", |value| value.as_str());
+            let session = event.session_label().map_or("-", |value| value.as_str());
             let agent = event.agent_id.as_ref().map_or("-", |value| value.as_str());
             let tool = event.tool_name.as_ref().map_or("-", |value| value.as_str());
             let status = event

@@ -236,7 +236,12 @@ mod tests {
             timestamp: Some(timestamp),
             timestamp_raw: None,
             session_key: Some("session-A".to_string()),
+            session_label: Some("session-A".to_string()),
             session_id: None,
+            session_source: None,
+            session_label_source: Some("payload".to_string()),
+            session_identity_conflicts: Vec::new(),
+            routing: Default::default(),
             agent_id: None,
             tool_name: Some("shell".to_string()),
             status: None,
@@ -264,7 +269,6 @@ mod tests {
             raw_line: String::new(),
             source_path: None,
             source_kind: None,
-            session_source: None,
             agent_source: None,
         }
     }

@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::session_identity::{SessionIdentityConflict, SessionRoutingMetadata};
+
 #[derive(Clone, Debug, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum Severity {
     Trace,
@@ -121,8 +123,12 @@ pub struct NormalizedEvent {
     pub source_path: Option<String>,
     pub source_kind: Option<String>,
     pub session_key: Option<String>,
+    pub session_label: Option<String>,
     pub session_id: Option<String>,
     pub session_source: Option<String>,
+    pub session_label_source: Option<String>,
+    pub session_identity_conflicts: Vec<SessionIdentityConflict>,
+    pub routing: SessionRoutingMetadata,
     pub agent_id: Option<String>,
     pub agent_source: Option<String>,
     pub tool_name: Option<String>,
@@ -218,11 +224,14 @@ impl NormalizedEvent {
     }
 
     pub fn durable_session_id(&self) -> Option<&str> {
-        self.session_id.as_deref().or(self.session_key.as_deref())
+        self.session_id.as_deref()
     }
 
     pub fn session_label(&self) -> Option<&String> {
-        self.session_key.as_ref().or(self.session_id.as_ref())
+        self.session_label
+            .as_ref()
+            .or(self.session_key.as_ref())
+            .or(self.session_id.as_ref())
     }
 
     pub fn fallback_signature(&self) -> Option<String> {

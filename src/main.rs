@@ -5,6 +5,7 @@ mod normalizer;
 mod output;
 mod parser;
 mod projection;
+mod session_identity;
 mod stale;
 mod tailer;
 mod tui;

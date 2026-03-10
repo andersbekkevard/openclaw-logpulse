@@ -1,5 +1,8 @@
 use crate::event::{NormalizedEvent, Severity, ToolEventKind};
 use crate::parser::ParsedLine;
+use crate::session_identity::{
+    build_session_identity, derive_routing_metadata, SessionIdentityState,
+};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -24,6 +27,19 @@ const SESSION_PATHS: &[&[&str]] = &[
     &["context", "session"],
     &["payload", "session_id"],
     &["payload", "session"],
+];
+
+const SESSION_LABEL_PATHS: &[&[&str]] = &[
+    &["session_label"],
+    &["sessionLabel"],
+    &["session", "label"],
+    &["session", "session_label"],
+    &["metadata", "session_label"],
+    &["metadata", "sessionLabel"],
+    &["context", "session_label"],
+    &["context", "sessionLabel"],
+    &["payload", "session_label"],
+    &["payload", "sessionLabel"],
 ];
 
 const AGENT_PATHS: &[&[&str]] = &[
@@ -217,8 +233,12 @@ fn empty_event(raw_line: String) -> NormalizedEvent {
         source_path: None,
         source_kind: None,
         session_key: None,
+        session_label: None,
         session_id: None,
         session_source: None,
+        session_label_source: None,
+        session_identity_conflicts: Vec::new(),
+        routing: Default::default(),
         agent_id: None,
         agent_source: None,
         tool_name: None,
@@ -274,7 +294,16 @@ fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> Vec<N
         .unwrap_or(Severity::Unknown);
 
     let session_key = first_string_from_paths(value, SESSION_PATHS);
-    let session_id = source_context.session_id.clone();
+    let payload_session_label = first_string_from_paths(value, SESSION_LABEL_PATHS);
+    let session_identity = build_session_identity(
+        source_context
+            .session_id
+            .as_deref()
+            .map(|value| (value, "path")),
+        session_key.as_deref(),
+        payload_session_label.as_deref(),
+    );
+    let routing = derive_routing_metadata(value, session_key.as_deref());
 
     let agent_id = first_string_from_paths(value, AGENT_PATHS).or(source_context.agent_id.clone());
     let tool_name = first_string_from_paths(value, TOOL_PATHS);
@@ -296,11 +325,12 @@ fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> Vec<N
         source_path: source_path.map(|path| path.display().to_string()),
         source_kind: source_path.map(|_| "session_log".to_string()),
         session_key,
-        session_id,
-        session_source: source_context
-            .session_id
-            .as_ref()
-            .map(|_| "path".to_string()),
+        session_label: session_identity.session_label,
+        session_id: session_identity.session_id,
+        session_source: session_identity.session_source,
+        session_label_source: session_identity.session_label_source,
+        session_identity_conflicts: session_identity.conflicts,
+        routing,
         agent_id,
         agent_source: source_context.agent_id.as_ref().map(|_| "path".to_string()),
         tool_name,
@@ -383,15 +413,32 @@ fn normalize_transcript_event(
         return Vec::new();
     };
     let (timestamp, timestamp_raw) = parse_timestamp(value);
-    let session_id = if entry_type == "session" {
-        value
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| source_context.session_id.clone())
+    let session_identity = if entry_type == "session" {
+        build_session_identity(
+            value
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|value| (value, "transcript"))
+                .or_else(|| {
+                    source_context
+                        .session_id
+                        .as_deref()
+                        .map(|value| (value, "path"))
+                }),
+            None,
+            None,
+        )
     } else {
-        source_context.session_id.clone()
+        build_session_identity(
+            source_context
+                .session_id
+                .as_deref()
+                .map(|value| (value, "path")),
+            None,
+            None,
+        )
     };
+    let session_id = session_identity.session_id.clone();
     let agent_id = source_context.agent_id.clone();
 
     match entry_type {
@@ -399,7 +446,11 @@ fn normalize_transcript_event(
             kind: ToolEventKind::Other,
             timestamp,
             timestamp_raw,
+            session_label: session_identity.session_label,
             session_id,
+            session_source: session_identity.session_source,
+            session_label_source: session_identity.session_label_source,
+            session_identity_conflicts: session_identity.conflicts,
             agent_id,
             result_summary: Some("session started".to_string()),
             level: Severity::Info,
@@ -409,9 +460,14 @@ fn normalize_transcript_event(
             message_id: value.get("id").and_then(Value::as_str).map(str::to_string),
             ..empty_event(raw.to_string())
         }],
-        "message" => {
-            normalize_transcript_message(raw, value, timestamp, timestamp_raw, session_id, agent_id)
-        }
+        "message" => normalize_transcript_message(
+            raw,
+            value,
+            timestamp,
+            timestamp_raw,
+            session_identity,
+            agent_id,
+        ),
         _ => Vec::new(),
     }
 }
@@ -421,7 +477,7 @@ fn normalize_transcript_message(
     value: &Value,
     timestamp: Option<DateTime<Utc>>,
     timestamp_raw: Option<String>,
-    session_id: Option<String>,
+    session_identity: SessionIdentityState,
     agent_id: Option<String>,
 ) -> Vec<NormalizedEvent> {
     let Some(message) = value.get("message") else {
@@ -453,7 +509,11 @@ fn normalize_transcript_message(
             kind: ToolEventKind::ToolCallResult,
             timestamp,
             timestamp_raw,
-            session_id,
+            session_label: session_identity.session_label.clone(),
+            session_id: session_identity.session_id.clone(),
+            session_source: session_identity.session_source.clone(),
+            session_label_source: session_identity.session_label_source.clone(),
+            session_identity_conflicts: session_identity.conflicts.clone(),
             agent_id,
             tool_name: first_string_from_paths(message, &[&["toolName"]]),
             status: first_string_from_paths(message, &[&["details", "status"]]).or_else(|| {
@@ -502,7 +562,11 @@ fn normalize_transcript_message(
                 kind: ToolEventKind::ToolCallStart,
                 timestamp,
                 timestamp_raw: timestamp_raw.clone(),
-                session_id: session_id.clone(),
+                session_label: session_identity.session_label.clone(),
+                session_id: session_identity.session_id.clone(),
+                session_source: session_identity.session_source.clone(),
+                session_label_source: session_identity.session_label_source.clone(),
+                session_identity_conflicts: session_identity.conflicts.clone(),
                 agent_id: agent_id.clone(),
                 tool_name: first_string_from_paths(tool_call, &[&["name"]]),
                 status: Some("started".to_string()),
@@ -537,7 +601,11 @@ fn normalize_transcript_message(
         kind: ToolEventKind::Other,
         timestamp,
         timestamp_raw,
-        session_id,
+        session_label: session_identity.session_label,
+        session_id: session_identity.session_id,
+        session_source: session_identity.session_source,
+        session_label_source: session_identity.session_label_source,
+        session_identity_conflicts: session_identity.conflicts,
         agent_id,
         message_id,
         parent_message_id,
@@ -1090,8 +1158,68 @@ mod tests {
 
         assert_eq!(normalized.session_key.as_deref(), Some("friendly-session"));
         assert_eq!(
+            normalized.session_label.as_deref(),
+            Some("friendly-session")
+        );
+        assert_eq!(
             normalized.session_id.as_deref(),
             Some("45b95685-dd1e-417f-9730-162a25f6e1b4")
         );
+        assert_eq!(normalized.session_source.as_deref(), Some("path"));
+        assert_eq!(normalized.session_label_source.as_deref(), Some("payload"));
+        assert_eq!(normalized.session_identity_conflicts.len(), 1);
+    }
+
+    #[test]
+    fn explicit_session_label_is_separate_from_durable_identity() {
+        let line = r#"{"event":"tool_call_start","timestamp":"2026-03-06T20:00:00Z","session_key":"friendly-session","session_label":"Friendly Session","tool":"search","call_id":"abc","level":"info"}"#;
+        let normalized = normalize_with_source(
+            line,
+            Some(Path::new(
+                "/home/anders/.openclaw/agents/main/sessions/45b95685-dd1e-417f-9730-162a25f6e1b4.jsonl",
+            )),
+        );
+
+        assert_eq!(
+            normalized.session_id.as_deref(),
+            Some("45b95685-dd1e-417f-9730-162a25f6e1b4")
+        );
+        assert_eq!(normalized.session_key.as_deref(), Some("friendly-session"));
+        assert_eq!(
+            normalized.session_label.as_deref(),
+            Some("Friendly Session")
+        );
+        assert_eq!(
+            normalized.session_label_source.as_deref(),
+            Some("payload_label")
+        );
+    }
+
+    #[test]
+    fn discord_routing_is_extracted_from_session_key() {
+        let line = r#"{"event":"tool_call_start","timestamp":"2026-03-06T20:00:00Z","session_key":"agent:main:discord:channel:1234567890","tool":"search","call_id":"abc","level":"info"}"#;
+        let normalized = normalize(line);
+
+        assert_eq!(normalized.routing.provider.as_deref(), Some("discord"));
+        assert_eq!(normalized.routing.channel_id.as_deref(), Some("1234567890"));
+        assert_eq!(
+            normalized.routing.channel_id_source.as_deref(),
+            Some("session_key")
+        );
+        assert!(normalized.routing.issues.is_empty());
+    }
+
+    #[test]
+    fn discord_routing_conflicts_are_explicit() {
+        let line = r#"{"event":"tool_call_start","timestamp":"2026-03-06T20:00:00Z","session_key":"agent:main:discord:channel:1234567890","metadata":{"channel_id":"9999999999"},"tool":"search","call_id":"abc","level":"info"}"#;
+        let normalized = normalize(line);
+
+        assert_eq!(normalized.routing.provider.as_deref(), Some("discord"));
+        assert!(normalized.routing.channel_id.is_none());
+        assert!(normalized
+            .routing
+            .issues
+            .iter()
+            .any(|issue| issue.field == "channel_id"));
     }
 }
