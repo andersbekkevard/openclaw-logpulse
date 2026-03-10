@@ -1,4 +1,4 @@
-use crate::discord::{DiscordConfig, DiscordHttpLookup, DiscordLookup, DiscordLookupError};
+use crate::discord::{CompositeDiscordLookup, DiscordLookup, DiscordLookupError};
 use crate::event::NormalizedEvent;
 use crate::session_identity::{shorten_non_discord_session_label, SessionRoutingMetadata};
 use chrono::{DateTime, Duration, Utc};
@@ -100,10 +100,7 @@ pub struct SessionLabelResolver {
 
 impl SessionLabelResolver {
     pub fn from_env(ttl: Duration) -> Self {
-        match DiscordConfig::from_env() {
-            Ok(config) => Self::with_lookup(ttl, DiscordHttpLookup::new(config)),
-            Err(error) => Self::unavailable(ttl, error),
-        }
+        Self::with_lookup(ttl, CompositeDiscordLookup::from_env())
     }
 
     pub fn with_lookup<L>(ttl: Duration, lookup: L) -> Self
@@ -140,6 +137,7 @@ impl SessionLabelResolver {
         }
     }
 
+    #[cfg(test)]
     pub fn unavailable(ttl: Duration, error: DiscordLookupError) -> Self {
         Self {
             ttl,

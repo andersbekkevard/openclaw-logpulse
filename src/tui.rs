@@ -934,8 +934,8 @@ impl App {
                     cells: vec![
                         format_ts(call.started_at.or(call.last_updated_at).unwrap_or(self.now)),
                         call_status_label(call.status).to_string(),
-                        truncate_display(&display_label, 20),
                         truncate_display(call.agent_id.as_deref().unwrap_or("-"), 12),
+                        truncate_display(&display_label, 20),
                         truncate_display(call.tool_name.as_deref().unwrap_or("-"), 14),
                         match call.duration_ms {
                             Some(ms) => format!("{ms}ms"),
@@ -989,8 +989,8 @@ impl App {
                     sort_at: session.last_activity_at.unwrap_or(self.now),
                     cells: vec![
                         format_ts(session.last_activity_at.unwrap_or(self.now)),
-                        truncate_display(&display_label, 22),
                         truncate_display(session.agent_id.as_deref().unwrap_or("-"), 12),
+                        truncate_display(&display_label, 22),
                         health,
                         session.open_call_count.to_string(),
                         session.stale_call_count.to_string(),
@@ -2041,8 +2041,8 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
         Tab::Calls => [
             Constraint::Length(8),
             Constraint::Length(11),
-            Constraint::Length(20),
             Constraint::Length(12),
+            Constraint::Length(20),
             Constraint::Length(14),
             Constraint::Length(10),
             Constraint::Min(20),
@@ -2050,8 +2050,8 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
         .to_vec(),
         Tab::Sessions => [
             Constraint::Length(8),
-            Constraint::Length(22),
             Constraint::Length(12),
+            Constraint::Length(22),
             Constraint::Length(14),
             Constraint::Length(10),
             Constraint::Length(10),
@@ -2065,10 +2065,10 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
             "time", "kind", "agent", "surface", "tool", "status", "preview",
         ],
         Tab::Calls => vec![
-            "time", "status", "surface", "agent", "tool", "duration", "preview",
+            "time", "status", "agent", "surface", "tool", "duration", "preview",
         ],
         Tab::Sessions => vec![
-            "time", "surface", "agent", "health", "open", "stale", "level",
+            "time", "agent", "surface", "health", "open", "stale", "level",
         ],
     };
 
@@ -3174,6 +3174,92 @@ mod tests {
         assert!(inspector.contains("Surface: #ops-war-room"));
         assert!(inspector.contains(&format!("Session ID: {session_id}")));
         assert!(inspector.contains(&format!("Discord Channel ID: {channel_id}")));
+
+        cleanup();
+    }
+
+    #[test]
+    fn discord_manifest_routing_updates_visible_surface_consistently_across_tabs() {
+        let session_id = "b18666a8-b5d5-4e92-a7a3-a2d1e72ac6f8";
+        let channel_id = "1477636729950179490";
+        let (session_path, cleanup) = write_session_fixture(
+            session_id,
+            &format!(
+                r#"{{
+  "agent:main:main": {{
+    "sessionId": "{session_id}",
+    "deliveryContext": {{
+      "channel": "discord",
+      "to": "channel:{channel_id}"
+    }},
+    "origin": {{
+      "provider": "discord",
+      "to": "channel:{channel_id}"
+    }}
+  }}
+}}"#
+            ),
+        );
+        let line = r#"{"type":"message","id":"60167cca","parentId":"1f5ac5f2","timestamp":"2026-03-07T09:31:19.656Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_a","name":"read","arguments":{"file_path":"/tmp/a"}}],"stopReason":"toolUse","timestamp":1772875879655}}"#;
+        let events = normalize_many_with_source(line, Some(&session_path));
+
+        let mut app = App::new(filters(), 30);
+        for event in events {
+            let ts = event.timestamp.expect("timestamp");
+            app.ingest_event(event, ts);
+        }
+        wait_for(|| app.refresh_session_labels(Utc::now()));
+
+        app.current_tab = Tab::Sessions;
+        let sessions_header = render_string(&mut app).expect("sessions render");
+        let sessions_header = sessions_header
+            .lines()
+            .find(|line| {
+                line.contains("time") && line.contains("agent") && line.contains("surface")
+            })
+            .expect("sessions header");
+        assert!(
+            sessions_header.find("agent").expect("agent")
+                < sessions_header.find("surface").expect("surface"),
+            "expected agent before surface: {sessions_header}"
+        );
+        let session_row = app
+            .visible_rows(Tab::Sessions)
+            .into_iter()
+            .next()
+            .expect("session row");
+        assert_eq!(session_row.cells[1], "private-channel-13");
+        assert_eq!(session_row.cells[2], "#private-channel-14");
+
+        app.current_tab = Tab::Calls;
+        let calls_header = render_string(&mut app).expect("calls render");
+        let calls_header = calls_header
+            .lines()
+            .find(|line| {
+                line.contains("time") && line.contains("status") && line.contains("surface")
+            })
+            .expect("calls header");
+        assert!(
+            calls_header.find("agent").expect("agent")
+                < calls_header.find("surface").expect("surface"),
+            "expected agent before surface: {calls_header}"
+        );
+        let call_row = app
+            .visible_rows(Tab::Calls)
+            .into_iter()
+            .next()
+            .expect("call row");
+        assert_eq!(call_row.cells[2], "private-channel-13");
+        assert_eq!(call_row.cells[3], "#private-channel-14");
+
+        app.current_tab = Tab::Events;
+        let event_row = app
+            .visible_rows(Tab::Events)
+            .into_iter()
+            .next()
+            .expect("event row");
+        assert_eq!(event_row.cells[2], "private-channel-13");
+        assert_eq!(event_row.cells[3], "#private-channel-14");
 
         cleanup();
     }

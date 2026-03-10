@@ -8,6 +8,17 @@ const TOKEN_ENV_VARS: &[&str] = &[
     "DISCORD_BOT_TOKEN",
 ];
 const API_BASE_ENV_VAR: &str = "LOGPULSE_DISCORD_API_BASE";
+const FALLBACK_DISCORD_CHANNELS: &[(&str, &str)] = &[
+    ("1477636729950179490", "private-channel-14"),
+    ("1477629839455555698", "private-channel-11"),
+    ("1477629901833244865", "private-channel-10"),
+    ("1477629926034112653", "private-channel-09"),
+    ("1477629953666191360", "private-channel-12"),
+    ("1477629973337739339", "private-channel-08"),
+    ("1477629989963698278", "private-channel-07"),
+    ("1478102405659754526", "private-channel-14"),
+    ("1480977465487917097", "private-channel-06"),
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiscordLookupErrorKind {
@@ -71,6 +82,26 @@ impl DiscordLookupError {
 
 pub trait DiscordLookup: Send + 'static {
     fn lookup_channel_name(&self, channel_id: &str) -> Result<String, DiscordLookupError>;
+}
+
+pub struct CompositeDiscordLookup {
+    http: Option<DiscordHttpLookup>,
+    unavailable_error: Option<DiscordLookupError>,
+}
+
+impl CompositeDiscordLookup {
+    pub fn from_env() -> Self {
+        match DiscordConfig::from_env() {
+            Ok(config) => Self {
+                http: Some(DiscordHttpLookup::new(config)),
+                unavailable_error: None,
+            },
+            Err(error) => Self {
+                http: None,
+                unavailable_error: Some(error),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +199,37 @@ impl DiscordLookup for DiscordHttpLookup {
     }
 }
 
+impl DiscordLookup for CompositeDiscordLookup {
+    fn lookup_channel_name(&self, channel_id: &str) -> Result<String, DiscordLookupError> {
+        if let Some(http) = &self.http {
+            match http.lookup_channel_name(channel_id) {
+                Ok(name) => return Ok(name),
+                Err(error) => {
+                    return fallback_channel_name(channel_id)
+                        .map(str::to_string)
+                        .ok_or(error);
+                }
+            }
+        }
+
+        fallback_channel_name(channel_id)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                self.unavailable_error.clone().unwrap_or_else(|| {
+                    DiscordLookupError::missing_config(
+                        "discord lookup worker is not configured",
+                    )
+                })
+            })
+    }
+}
+
+fn fallback_channel_name(channel_id: &str) -> Option<&'static str> {
+    FALLBACK_DISCORD_CHANNELS
+        .iter()
+        .find_map(|(candidate, name)| (*candidate == channel_id).then_some(*name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +304,31 @@ mod tests {
         .expect("config");
 
         assert_eq!(config.token, "preferred-discord-token");
+    }
+
+    #[test]
+    fn composite_lookup_uses_known_channel_fallback_without_token() {
+        let lookup = CompositeDiscordLookup {
+            http: None,
+            unavailable_error: Some(DiscordLookupError::missing_token("missing token")),
+        };
+
+        assert_eq!(
+            lookup.lookup_channel_name("1477636729950179490"),
+            Ok("dev".to_string())
+        );
+    }
+
+    #[test]
+    fn composite_lookup_preserves_missing_token_for_unknown_channels() {
+        let lookup = CompositeDiscordLookup {
+            http: None,
+            unavailable_error: Some(DiscordLookupError::missing_token("missing token")),
+        };
+
+        assert_eq!(
+            lookup.lookup_channel_name("1234567890"),
+            Err(DiscordLookupError::missing_token("missing token"))
+        );
     }
 }
