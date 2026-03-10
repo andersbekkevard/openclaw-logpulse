@@ -179,10 +179,7 @@ impl NormalizedEvent {
 
         if let Some(session_filter) = session_substring {
             let needle = session_filter.to_ascii_lowercase();
-            let session_matches = self
-                .session_label()
-                .map(|value| value.to_ascii_lowercase().contains(&needle))
-                .unwrap_or(false);
+            let session_matches = self.matches_session_filter(&needle);
             if !session_matches {
                 return false;
             }
@@ -254,6 +251,15 @@ impl NormalizedEvent {
         }
     }
 
+    fn matches_session_filter(&self, needle: &str) -> bool {
+        self.session_id
+            .as_ref()
+            .into_iter()
+            .chain(self.session_key.as_ref())
+            .chain(self.session_label.as_ref())
+            .any(|value| value.to_ascii_lowercase().contains(needle))
+    }
+
     fn preferred_identity_hint(&self) -> Option<String> {
         let preferred_keys = ["command", "cmd", "path", "file_path", "query", "url"];
         for key in preferred_keys {
@@ -272,5 +278,65 @@ impl NormalizedEvent {
             .or_else(|| self.message.clone())
             .or_else(|| self.result_preview.clone())
             .or_else(|| self.result_summary.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NormalizedEvent, Severity, TimeFilter, ToolEventKind};
+    use crate::session_identity::SessionRoutingMetadata;
+
+    fn event() -> NormalizedEvent {
+        NormalizedEvent {
+            kind: ToolEventKind::ToolCallStart,
+            timestamp: None,
+            timestamp_raw: None,
+            source_path: None,
+            source_kind: None,
+            session_key: Some("friendly-session".to_string()),
+            session_label: Some("Friendly Session".to_string()),
+            session_id: Some("45b95685-dd1e-417f-9730-162a25f6e1b4".to_string()),
+            session_source: Some("path".to_string()),
+            session_label_source: Some("payload_label".to_string()),
+            session_identity_conflicts: Vec::new(),
+            routing: SessionRoutingMetadata::default(),
+            agent_id: None,
+            agent_source: None,
+            tool_name: Some("search".to_string()),
+            status: None,
+            result_summary: None,
+            result_preview: None,
+            result_raw: None,
+            result_metrics: Vec::new(),
+            exit_code: None,
+            duration_ms: None,
+            is_error: None,
+            call_id: None,
+            call_ids: Vec::new(),
+            correlation_ids: Vec::new(),
+            message_id: None,
+            parent_message_id: None,
+            transcript_tool_call_index: None,
+            transcript_tool_call_count: None,
+            level: Severity::Info,
+            level_raw: None,
+            params: Vec::new(),
+            args_preview: Vec::new(),
+            args_raw: None,
+            args_truncated: false,
+            message: None,
+            raw_line: String::new(),
+        }
+    }
+
+    #[test]
+    fn session_filter_matches_durable_id_and_friendly_label() {
+        let event = event();
+        let time = TimeFilter::default();
+        let durable = "45b95685-dd1e-417f-9730-162a25f6e1b4".to_string();
+        let label = "Friendly".to_string();
+
+        assert!(event.should_filter(Some(&durable), None, None, Severity::Trace, Some(&time)));
+        assert!(event.should_filter(Some(&label), None, None, Severity::Trace, Some(&time)));
     }
 }

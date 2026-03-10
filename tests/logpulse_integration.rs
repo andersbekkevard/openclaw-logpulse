@@ -21,12 +21,7 @@ fn fixture(name: &str) -> PathBuf {
 fn binary_path() -> PathBuf {
     env::var("CARGO_BIN_EXE_logpulse")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            project_root()
-                .join("target")
-                .join("debug")
-                .join("logpulse")
-        })
+        .unwrap_or_else(|_| project_root().join("target").join("debug").join("logpulse"))
 }
 
 struct TempDir {
@@ -301,6 +296,49 @@ fn since_and_until_filter_actual_output() {
     assert_eq!(
         timestamps,
         vec!["2026-03-06T10:00:02Z", "2026-03-06T10:00:04Z"]
+    );
+}
+
+#[test]
+fn session_filter_matches_durable_path_session_id_even_with_friendly_label() {
+    let tmp = TempDir::new("session-filter-durable-id");
+    let log = tmp
+        .path()
+        .join(".openclaw")
+        .join("agents")
+        .join("main")
+        .join("sessions")
+        .join("45b95685-dd1e-417f-9730-162a25f6e1b4.jsonl");
+    fs::create_dir_all(log.parent().expect("sessions dir")).expect("create sessions dir");
+    append_line(
+        &log,
+        r#"{"event":"tool_call_start","timestamp":"2026-03-06T20:00:00Z","session_key":"friendly-session","session_label":"Friendly Session","tool":"search","call_id":"abc","level":"info"}"#,
+    );
+
+    let (stdout, stderr, status) = run_cli(&[
+        "--no-follow",
+        "--from-start",
+        "--stale-seconds",
+        "1000000",
+        "--format",
+        "json",
+        "--session",
+        "45b95685-dd1e-417f-9730-162a25f6e1b4",
+        log.to_str().expect("fixture path"),
+    ]);
+
+    assert_eq!(status, 0, "stderr: {stderr}");
+    let records = parse_json_lines(&stdout);
+    let events: Vec<_> = records
+        .iter()
+        .filter(|record| record.get("kind").and_then(Value::as_str) == Some("tool_event"))
+        .collect();
+    assert_eq!(events.len(), 1, "stdout: {stdout}");
+    assert_eq!(
+        events[0]
+            .pointer("/event/session_id")
+            .and_then(Value::as_str),
+        Some("45b95685-dd1e-417f-9730-162a25f6e1b4")
     );
 }
 

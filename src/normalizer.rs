@@ -413,6 +413,7 @@ fn normalize_transcript_event(
         return Vec::new();
     };
     let (timestamp, timestamp_raw) = parse_timestamp(value);
+    let routing = derive_routing_metadata(value, None);
     let session_identity = if entry_type == "session" {
         build_session_identity(
             value
@@ -451,6 +452,7 @@ fn normalize_transcript_event(
             session_source: session_identity.session_source,
             session_label_source: session_identity.session_label_source,
             session_identity_conflicts: session_identity.conflicts,
+            routing,
             agent_id,
             result_summary: Some("session started".to_string()),
             level: Severity::Info,
@@ -466,6 +468,7 @@ fn normalize_transcript_event(
             timestamp,
             timestamp_raw,
             session_identity,
+            routing,
             agent_id,
         ),
         _ => Vec::new(),
@@ -478,6 +481,7 @@ fn normalize_transcript_message(
     timestamp: Option<DateTime<Utc>>,
     timestamp_raw: Option<String>,
     session_identity: SessionIdentityState,
+    routing: crate::session_identity::SessionRoutingMetadata,
     agent_id: Option<String>,
 ) -> Vec<NormalizedEvent> {
     let Some(message) = value.get("message") else {
@@ -514,6 +518,7 @@ fn normalize_transcript_message(
             session_source: session_identity.session_source.clone(),
             session_label_source: session_identity.session_label_source.clone(),
             session_identity_conflicts: session_identity.conflicts.clone(),
+            routing: routing.clone(),
             agent_id,
             tool_name: first_string_from_paths(message, &[&["toolName"]]),
             status: first_string_from_paths(message, &[&["details", "status"]]).or_else(|| {
@@ -567,6 +572,7 @@ fn normalize_transcript_message(
                 session_source: session_identity.session_source.clone(),
                 session_label_source: session_identity.session_label_source.clone(),
                 session_identity_conflicts: session_identity.conflicts.clone(),
+                routing: routing.clone(),
                 agent_id: agent_id.clone(),
                 tool_name: first_string_from_paths(tool_call, &[&["name"]]),
                 status: Some("started".to_string()),
@@ -606,6 +612,7 @@ fn normalize_transcript_message(
         session_source: session_identity.session_source,
         session_label_source: session_identity.session_label_source,
         session_identity_conflicts: session_identity.conflicts,
+        routing,
         agent_id,
         message_id,
         parent_message_id,
@@ -1221,5 +1228,24 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.field == "channel_id"));
+    }
+
+    #[test]
+    fn transcript_normalization_preserves_discord_routing_metadata() {
+        let line = r#"{"type":"message","id":"60167cca","parentId":"1f5ac5f2","timestamp":"2026-03-07T09:31:19.656Z","metadata":{"provider":"discord","channel_id":"1234567890"},"message":{"role":"assistant","content":[{"type":"toolCall","id":"call_a","name":"read","arguments":{"file_path":"/tmp/a"}}],"stopReason":"toolUse","timestamp":1772875879655}}"#;
+        let normalized = normalize_with_source(
+            line,
+            Some(Path::new(
+                "/home/anders/.openclaw/agents/main/sessions/45b95685-dd1e-417f-9730-162a25f6e1b4.jsonl",
+            )),
+        );
+
+        assert_eq!(normalized.routing.provider.as_deref(), Some("discord"));
+        assert_eq!(normalized.routing.channel_id.as_deref(), Some("1234567890"));
+        assert_eq!(
+            normalized.routing.channel_id_source.as_deref(),
+            Some("metadata.channel_id")
+        );
+        assert!(normalized.routing.issues.is_empty());
     }
 }

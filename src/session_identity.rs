@@ -111,10 +111,6 @@ pub fn derive_routing_metadata(value: &Value, session_key: Option<&str>) -> Sess
         }
     }
 
-    if !channel_candidates.is_empty() {
-        provider_candidates.push(Candidate::new("discord", "channel_id"));
-    }
-
     let provider = select_candidate("provider", provider_candidates, &mut issues);
     let channel = select_candidate("channel_id", channel_candidates, &mut issues);
 
@@ -448,6 +444,16 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.kind == RoutingIssueKind::Missing && issue.field == "channel_id"));
+    }
+
+    #[test]
+    fn bare_numeric_channel_id_does_not_imply_discord_provider() {
+        let routing =
+            derive_routing_metadata(&json!({"metadata": {"channel_id": "1234567890"}}), None);
+
+        assert!(routing.provider.is_none());
+        assert_eq!(routing.channel_id.as_deref(), Some("1234567890"));
+        assert!(routing.issues.is_empty());
     }
 
     #[test]
