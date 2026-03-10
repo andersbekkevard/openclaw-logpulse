@@ -5,6 +5,7 @@ use crate::projection::{
     CallStatus, CorrelatedCall, HealthConfig, HealthStatus, MatchConfidence, ProjectionFilter,
     ProjectionStore, SessionSummary,
 };
+use crate::session_label::{SessionLabelInput, SessionLabelResolver};
 use crate::stale::{HeartbeatSummary, StaleTracker, StaleWarning};
 use crate::{discovery, tailer};
 use chrono::{DateTime, Local, Utc};
@@ -30,6 +31,7 @@ use std::time::{Duration, Instant};
 const DRAIN_PER_TICK: usize = 128;
 const MISSING_TTL_SECONDS: u64 = 30;
 const PREVIEW_LEN: usize = 72;
+const SESSION_LABEL_CACHE_TTL_MINUTES: i64 = 15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Tab {
@@ -475,6 +477,7 @@ const KEY_BINDINGS: &[KeyBinding] = &[
 struct App {
     store: ProjectionStore,
     events_by_ref: HashMap<String, NormalizedEvent>,
+    session_labels: SessionLabelResolver,
     notices: Vec<NoticeRecord>,
     latest_heartbeat: Option<HeartbeatSummary>,
     current_tab: Tab,
@@ -491,9 +494,24 @@ struct App {
 
 impl App {
     fn new(filters: WorkspaceFilters, stale_after_seconds: u64) -> Self {
+        Self::with_session_labels(
+            filters,
+            stale_after_seconds,
+            SessionLabelResolver::from_env(chrono::Duration::minutes(
+                SESSION_LABEL_CACHE_TTL_MINUTES,
+            )),
+        )
+    }
+
+    fn with_session_labels(
+        filters: WorkspaceFilters,
+        stale_after_seconds: u64,
+        session_labels: SessionLabelResolver,
+    ) -> Self {
         Self {
             store: ProjectionStore::default(),
             events_by_ref: HashMap::new(),
+            session_labels,
             notices: Vec::new(),
             latest_heartbeat: None,
             current_tab: Tab::Events,
@@ -548,10 +566,17 @@ impl App {
 
     fn ingest_event(&mut self, event: NormalizedEvent, observed_at: DateTime<Utc>) {
         let before = self.snapshot_visible_keys();
+        if let Some(input) = SessionLabelInput::from_event(&event) {
+            self.session_labels.observe_session(input, observed_at);
+        }
         let event_ref = self.store.ingest_event(event.clone(), observed_at);
         self.events_by_ref.insert(event_ref, event);
         self.now = observed_at;
         self.reconcile_after_data_change(before);
+    }
+
+    fn refresh_session_labels(&mut self, now: DateTime<Utc>) -> bool {
+        self.session_labels.refresh(now)
     }
 
     fn ingest_warning(&mut self, warning: StaleWarning, observed_at: DateTime<Utc>) {
@@ -675,6 +700,10 @@ impl App {
             .event_rows(&self.projection_filter())
             .into_iter()
             .filter(|row| {
+                let display_label = self.display_session_label(
+                    row.session_id.as_deref(),
+                    row.session_label.as_deref(),
+                );
                 if self.filters.stale_only {
                     return false;
                 }
@@ -689,33 +718,39 @@ impl App {
                     }
                 }
                 self.matches_text_search(&[
-                    row.session_label.as_deref().unwrap_or_default(),
+                    display_label.as_str(),
                     row.agent_id.as_deref().unwrap_or_default(),
                     row.tool_name.as_deref().unwrap_or_default(),
                     row.status.as_deref().unwrap_or_default(),
                     row.preview.as_deref().unwrap_or_default(),
                 ])
             })
-            .map(|row| VisibleRow {
-                key: EntityKey::Event(row.event_ref.clone()),
-                searchable: [
-                    row.session_label.clone().unwrap_or_default(),
-                    row.agent_id.clone().unwrap_or_default(),
-                    row.tool_name.clone().unwrap_or_default(),
-                    row.status.clone().unwrap_or_default(),
-                    row.preview.clone().unwrap_or_default(),
-                ]
-                .join(" "),
-                sort_at: row.timestamp.unwrap_or(self.now),
-                cells: vec![
-                    format_ts(row.timestamp.unwrap_or(self.now)),
-                    kind_label(&row.kind).to_string(),
-                    truncate_display(row.session_label.as_deref().unwrap_or("-"), 20),
-                    truncate_display(row.agent_id.as_deref().unwrap_or("-"), 12),
-                    truncate_display(row.tool_name.as_deref().unwrap_or("-"), 14),
-                    truncate_display(row.status.as_deref().unwrap_or("-"), 14),
-                    truncate_display(row.preview.as_deref().unwrap_or("-"), PREVIEW_LEN),
-                ],
+            .map(|row| {
+                let display_label = self.display_session_label(
+                    row.session_id.as_deref(),
+                    row.session_label.as_deref(),
+                );
+                VisibleRow {
+                    key: EntityKey::Event(row.event_ref.clone()),
+                    searchable: [
+                        display_label.clone(),
+                        row.agent_id.clone().unwrap_or_default(),
+                        row.tool_name.clone().unwrap_or_default(),
+                        row.status.clone().unwrap_or_default(),
+                        row.preview.clone().unwrap_or_default(),
+                    ]
+                    .join(" "),
+                    sort_at: row.timestamp.unwrap_or(self.now),
+                    cells: vec![
+                        format_ts(row.timestamp.unwrap_or(self.now)),
+                        kind_label(&row.kind).to_string(),
+                        truncate_display(&display_label, 20),
+                        truncate_display(row.agent_id.as_deref().unwrap_or("-"), 12),
+                        truncate_display(row.tool_name.as_deref().unwrap_or("-"), 14),
+                        truncate_display(row.status.as_deref().unwrap_or("-"), 14),
+                        truncate_display(row.preview.as_deref().unwrap_or("-"), PREVIEW_LEN),
+                    ],
+                }
             })
             .collect::<Vec<_>>();
 
@@ -834,6 +869,10 @@ impl App {
             .correlated_calls(&self.projection_filter(), self.now, &self.health)
             .into_iter()
             .filter(|call| {
+                let display_label = self.display_session_label(
+                    Some(call.session_id.as_str()),
+                    Some(call.session_label.as_str()),
+                );
                 if let Some(session_id) = state.scope.session_id.as_ref() {
                     if &call.session_id != session_id {
                         return false;
@@ -844,34 +883,40 @@ impl App {
                 }
                 self.matches_text_search(&[
                     &call.session_id,
-                    &call.session_label,
+                    &display_label,
                     call.agent_id.as_deref().unwrap_or_default(),
                     call.tool_name.as_deref().unwrap_or_default(),
                     call.message_preview.as_deref().unwrap_or_default(),
                 ])
             })
-            .map(|call| VisibleRow {
-                key: EntityKey::Call(call.call_entity_id.clone()),
-                searchable: [
-                    call.session_label.clone(),
-                    call.agent_id.clone().unwrap_or_default(),
-                    call.tool_name.clone().unwrap_or_default(),
-                    call.message_preview.clone().unwrap_or_default(),
-                ]
-                .join(" "),
-                sort_at: call.started_at.or(call.last_updated_at).unwrap_or(self.now),
-                cells: vec![
-                    format_ts(call.started_at.or(call.last_updated_at).unwrap_or(self.now)),
-                    call_status_label(call.status).to_string(),
-                    truncate_display(&call.session_label, 20),
-                    truncate_display(call.agent_id.as_deref().unwrap_or("-"), 12),
-                    truncate_display(call.tool_name.as_deref().unwrap_or("-"), 14),
-                    match call.duration_ms {
-                        Some(ms) => format!("{ms}ms"),
-                        None => "-".to_string(),
-                    },
-                    truncate_display(call.message_preview.as_deref().unwrap_or("-"), PREVIEW_LEN),
-                ],
+            .map(|call| {
+                let display_label = self.display_session_label(
+                    Some(call.session_id.as_str()),
+                    Some(call.session_label.as_str()),
+                );
+                VisibleRow {
+                    key: EntityKey::Call(call.call_entity_id.clone()),
+                    searchable: [
+                        display_label.clone(),
+                        call.agent_id.clone().unwrap_or_default(),
+                        call.tool_name.clone().unwrap_or_default(),
+                        call.message_preview.clone().unwrap_or_default(),
+                    ]
+                    .join(" "),
+                    sort_at: call.started_at.or(call.last_updated_at).unwrap_or(self.now),
+                    cells: vec![
+                        format_ts(call.started_at.or(call.last_updated_at).unwrap_or(self.now)),
+                        call_status_label(call.status).to_string(),
+                        truncate_display(&display_label, 20),
+                        truncate_display(call.agent_id.as_deref().unwrap_or("-"), 12),
+                        truncate_display(call.tool_name.as_deref().unwrap_or("-"), 14),
+                        match call.duration_ms {
+                            Some(ms) => format!("{ms}ms"),
+                            None => "-".to_string(),
+                        },
+                        truncate_display(call.message_preview.as_deref().unwrap_or("-"), PREVIEW_LEN),
+                    ],
+                }
             })
             .collect()
     }
@@ -881,6 +926,10 @@ impl App {
             .sessions(&self.projection_filter(), self.now, &self.health)
             .into_iter()
             .filter(|session| {
+                let display_label = self.display_session_label(
+                    Some(session.session_id.as_str()),
+                    Some(session.session_label.as_str()),
+                );
                 if self.filters.stale_only
                     && session.health_status != HealthStatus::Stale
                     && session.health_status != HealthStatus::Disconnected
@@ -889,16 +938,20 @@ impl App {
                 }
                 self.matches_text_search(&[
                     &session.session_id,
-                    &session.session_label,
+                    &display_label,
                     session.agent_id.as_deref().unwrap_or_default(),
                 ])
             })
             .map(|session| {
                 let health = health_status_label(session.health_status.clone()).to_string();
+                let display_label = self.display_session_label(
+                    Some(session.session_id.as_str()),
+                    Some(session.session_label.as_str()),
+                );
                 VisibleRow {
                     key: EntityKey::Session(session.session_id.clone()),
                     searchable: [
-                        session.session_label.clone(),
+                        display_label.clone(),
                         session.agent_id.clone().unwrap_or_default(),
                         health.clone(),
                     ]
@@ -906,7 +959,7 @@ impl App {
                     sort_at: session.last_activity_at.unwrap_or(self.now),
                     cells: vec![
                         format_ts(session.last_activity_at.unwrap_or(self.now)),
-                        truncate_display(&session.session_label, 22),
+                        truncate_display(&display_label, 22),
                         truncate_display(session.agent_id.as_deref().unwrap_or("-"), 12),
                         health,
                         session.open_call_count.to_string(),
@@ -1122,6 +1175,7 @@ impl App {
         let Some(event) = self.events_by_ref.get(event_ref) else {
             return Text::from("Missing event");
         };
+        let display_label = self.session_labels.state_for_event(event).display().to_string();
         let mut lines = vec![title_line(
             &format!(
                 "{} {}",
@@ -1134,13 +1188,13 @@ impl App {
             "Timestamp",
             &event.timestamp.unwrap_or(self.now).to_rfc3339(),
         ));
-        lines.push(kv_line(
-            "Session",
-            event
-                .session_id
-                .as_deref()
-                .unwrap_or_else(|| event.session_key.as_deref().unwrap_or("-")),
-        ));
+        lines.push(kv_line("Session", &display_label));
+        if let Some(session_id) = event.session_id.as_deref() {
+            lines.push(kv_line("Session ID", session_id));
+        }
+        if let Some(channel_id) = event.routing.channel_id.as_deref() {
+            lines.push(kv_line("Discord Channel ID", channel_id));
+        }
         lines.push(kv_line("Agent", event.agent_id.as_deref().unwrap_or("-")));
         lines.push(kv_line("Tool", event.tool_name.as_deref().unwrap_or("-")));
         lines.push(kv_line("Status", event.status.as_deref().unwrap_or("-")));
@@ -1214,13 +1268,16 @@ impl App {
         let Some(call) = self.call_by_id(call_id) else {
             return Text::from("Missing call");
         };
+        let display_label =
+            self.display_session_label(Some(&call.session_id), Some(&call.session_label));
         Text::from(vec![
             title_line(
                 &format!("CALL {}", call.tool_name.as_deref().unwrap_or("-")),
                 tool_color(call.tool_name.as_deref().unwrap_or("call")),
             ),
             kv_line("Entity ID", &call.call_entity_id),
-            kv_line("Session", &call.session_label),
+            kv_line("Session", &display_label),
+            kv_line("Session ID", &call.session_id),
             kv_line("Status", call_status_label(call.status)),
             kv_line(
                 "Confidence",
@@ -1269,10 +1326,12 @@ impl App {
         let Some(session) = self.session_by_id(session_id) else {
             return Text::from("Missing session");
         };
+        let display_label =
+            self.display_session_label(Some(&session.session_id), Some(&session.session_label));
         Text::from(vec![
             title_line("SESSION", Color::Cyan),
             kv_line("Session ID", &session.session_id),
-            kv_line("Label", &session.session_label),
+            kv_line("Label", &display_label),
             kv_line("Agent", session.agent_id.as_deref().unwrap_or("-")),
             kv_line(
                 "Last activity",
@@ -1306,7 +1365,8 @@ impl App {
         let scope = self.current_tab_state().scope.clone();
         let mut parts = vec![self.current_tab.title().to_string()];
         if let Some(session_id) = scope.session_id {
-            parts.push(format!("session {session_id}"));
+            let label = self.display_session_label(Some(&session_id), Some(&session_id));
+            parts.push(format!("session {label}"));
         }
         if let Some(call_id) = scope.call_entity_id {
             let label = self
@@ -1325,6 +1385,23 @@ impl App {
             parts[0] = "Event Detail".to_string();
         }
         parts.join(" / ")
+    }
+
+    fn display_session_label(
+        &self,
+        session_id: Option<&str>,
+        raw_label: Option<&str>,
+    ) -> String {
+        match session_id {
+            Some(session_id) => self
+                .session_labels
+                .state_for_session(session_id, raw_label)
+                .display()
+                .to_string(),
+            None => crate::session_identity::shorten_non_discord_session_label(
+                raw_label.unwrap_or("-"),
+            ),
+        }
     }
 
     fn health_counts(&self) -> (usize, usize, usize) {
@@ -1456,6 +1533,7 @@ fn run_app(
             }
 
             drain_multi_tailer(&mut tailer, &mut tracker, &mut app);
+            app.refresh_session_labels(Utc::now());
             terminal.draw(|frame| render(frame, &app))?;
         }
 
@@ -1479,6 +1557,7 @@ fn run_app(
                 Utc::now(),
             );
             loop {
+                app.refresh_session_labels(Utc::now());
                 terminal.draw(|frame| render(frame, &app))?;
                 if handle_input(&mut app, ui_tick)? {
                     break;
@@ -1500,6 +1579,7 @@ fn run_app(
         }
 
         drain_single_tailer(&mut tailer, &log_file, &mut tracker, &mut app);
+        app.refresh_session_labels(Utc::now());
         terminal.draw(|frame| render(frame, &app))?;
     }
 
@@ -2101,8 +2181,47 @@ fn format_filters(args: &Args) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discord::{DiscordLookup, DiscordLookupError};
+    use crate::session_identity::SessionRoutingMetadata;
+    use crate::session_label::SessionLabelResolver;
     use ratatui::backend::TestBackend;
     use std::io;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration as StdDuration;
+
+    struct BlockingDiscordLookup {
+        request_tx: mpsc::Sender<String>,
+        release_rx: mpsc::Receiver<Result<String, DiscordLookupError>>,
+    }
+
+    impl BlockingDiscordLookup {
+        fn new() -> (
+            Self,
+            mpsc::Receiver<String>,
+            mpsc::Sender<Result<String, DiscordLookupError>>,
+        ) {
+            let (request_tx, request_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            (
+                Self {
+                    request_tx,
+                    release_rx,
+                },
+                request_rx,
+                release_tx,
+            )
+        }
+    }
+
+    impl DiscordLookup for BlockingDiscordLookup {
+        fn lookup_channel_name(&self, channel_id: &str) -> Result<String, DiscordLookupError> {
+            self.request_tx
+                .send(channel_id.to_string())
+                .expect("send lookup request");
+            self.release_rx.recv().expect("receive lookup result")
+        }
+    }
 
     fn event(
         session_id: &str,
@@ -2161,21 +2280,61 @@ mod tests {
         }
     }
 
+    fn discord_event(
+        session_id: &str,
+        channel_id: &str,
+        tool: &str,
+        call_id: Option<&str>,
+        kind: ToolEventKind,
+        timestamp: &str,
+    ) -> NormalizedEvent {
+        let mut event = event(
+            session_id,
+            Some(&format!("agent:main:discord:channel:{channel_id}")),
+            tool,
+            call_id,
+            kind,
+            timestamp,
+        );
+        event.routing = SessionRoutingMetadata {
+            provider: Some("discord".to_string()),
+            provider_source: Some("session_key".to_string()),
+            channel_id: Some(channel_id.to_string()),
+            channel_id_source: Some("session_key".to_string()),
+            issues: Vec::new(),
+        };
+        event
+    }
+
     fn app() -> App {
-        App::new(
-            WorkspaceFilters {
-                session: None,
-                agent: None,
-                tool: None,
-                min_level: Severity::Trace,
-                time: TimeFilter::default(),
-                include_system_events: false,
-                stale_only: false,
-                text_search: None,
-                summary: "test".to_string(),
-            },
-            30,
-        )
+        App::new(filters(), 30)
+    }
+
+    fn filters() -> WorkspaceFilters {
+        WorkspaceFilters {
+            session: None,
+            agent: None,
+            tool: None,
+            min_level: Severity::Trace,
+            time: TimeFilter::default(),
+            include_system_events: false,
+            stale_only: false,
+            text_search: None,
+            summary: "test".to_string(),
+        }
+    }
+
+    fn wait_for<F>(mut condition: F)
+    where
+        F: FnMut() -> bool,
+    {
+        for _ in 0..50 {
+            if condition() {
+                return;
+            }
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        panic!("condition was not met in time");
     }
 
     fn seed(app: &mut App) {
@@ -2405,5 +2564,46 @@ mod tests {
         assert!(call_scoped_rows
             .iter()
             .any(|row| row.key == EntityKey::Notice("notice-1".to_string())));
+    }
+
+    #[test]
+    fn discord_resolution_updates_workspace_rows_and_breadcrumbs() {
+        let (lookup, request_rx, release_tx) = BlockingDiscordLookup::new();
+        let mut app = App::with_session_labels(
+            filters(),
+            30,
+            SessionLabelResolver::with_lookup(chrono::Duration::minutes(5), lookup),
+        );
+        let item = discord_event(
+            "session-discord",
+            "1234567890",
+            "read",
+            Some("call-1"),
+            ToolEventKind::ToolCallStart,
+            "2026-03-07T10:00:00Z",
+        );
+        let ts = item.timestamp.expect("timestamp");
+        app.ingest_event(item, ts);
+        app.switch_tab(Tab::Sessions);
+
+        let pending = render_string(&app).expect("pending render");
+        assert!(pending.contains("#1234567890 (resolving)"));
+        assert_eq!(
+            request_rx.recv_timeout(StdDuration::from_secs(1)).expect("request"),
+            "1234567890"
+        );
+
+        release_tx
+            .send(Ok("ops-war-room".to_string()))
+            .expect("release lookup");
+        wait_for(|| app.refresh_session_labels(Utc::now()));
+
+        app.tab_state_mut(Tab::Sessions).selected =
+            Some(EntityKey::Session("session-discord".to_string()));
+        app.activate_selected();
+
+        let resolved = render_string(&app).expect("resolved render");
+        assert!(resolved.contains("#ops-war-room"));
+        assert!(resolved.contains("session #ops-war-room"));
     }
 }
