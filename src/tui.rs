@@ -1228,7 +1228,7 @@ impl App {
             "Timestamp",
             &event.timestamp.unwrap_or(self.now).to_rfc3339(),
         ));
-        lines.push(kv_line("Session", &display_label));
+        lines.push(kv_line("Surface", &display_label));
         if let Some(session_id) = event.session_id.as_deref() {
             lines.push(kv_line("Session ID", session_id));
         }
@@ -1316,7 +1316,7 @@ impl App {
                 tool_color(call.tool_name.as_deref().unwrap_or("call")),
             ),
             kv_line("Entity ID", &call.call_entity_id),
-            kv_line("Session", &display_label),
+            kv_line("Surface", &display_label),
             kv_line("Session ID", &call.session_id),
             match call.session_label_info.kind {
                 SessionLabelKind::DiscordChannelId => kv_line(
@@ -2049,13 +2049,13 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
 
     let header = match app.current_tab {
         Tab::Events => vec![
-            "time", "kind", "session", "agent", "tool", "status", "preview",
+            "time", "kind", "surface", "agent", "tool", "status", "preview",
         ],
         Tab::Calls => vec![
-            "time", "status", "session", "agent", "tool", "duration", "preview",
+            "time", "status", "surface", "agent", "tool", "duration", "preview",
         ],
         Tab::Sessions => vec![
-            "time", "session", "agent", "health", "open", "stale", "level",
+            "time", "surface", "agent", "health", "open", "stale", "level",
         ],
     };
 
@@ -2379,13 +2379,16 @@ fn format_filters(args: &Args) -> String {
 mod tests {
     use super::*;
     use crate::discord::{DiscordLookup, DiscordLookupError};
+    use crate::normalizer::normalize_many_with_source;
     use crate::session_identity::SessionRoutingMetadata;
     use crate::session_label::SessionLabelResolver;
     use ratatui::backend::TestBackend;
+    use std::fs;
     use std::io;
+    use std::path::PathBuf;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration as StdDuration;
+    use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
     struct BlockingDiscordLookup {
         request_tx: mpsc::Sender<String>,
@@ -2641,6 +2644,41 @@ mod tests {
 
     fn render_string(app: &mut App) -> io::Result<String> {
         render_string_with_size(app, 120, 40)
+    }
+
+    fn write_session_fixture(session_id: &str, manifest: &str) -> (PathBuf, Box<dyn FnOnce()>) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("logpulse-tui-{unique}"));
+        let sessions_dir = root.join("agents").join("private-channel-13").join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_path = sessions_dir.join(format!("{session_id}.jsonl"));
+        fs::write(&session_path, "").expect("write session file");
+        fs::write(sessions_dir.join("sessions.json"), manifest).expect("write sessions manifest");
+
+        let cleanup_root = root.clone();
+        (
+            session_path,
+            Box::new(move || {
+                let _ = fs::remove_dir_all(cleanup_root);
+            }),
+        )
+    }
+
+    fn inspector_string(app: &App) -> String {
+        app.inspector_text()
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -3043,5 +3081,122 @@ mod tests {
         let resolved = render_string(&mut app).expect("resolved render");
         assert!(resolved.contains("#ops-war-room"));
         assert!(resolved.contains("session #ops-war-room"));
+    }
+
+    #[test]
+    fn discord_manifest_routing_updates_event_surface_and_inspector() {
+        let session_id = "b18666a8-b5d5-4e92-a7a3-a2d1e72ac6f8";
+        let channel_id = "1477636729950179490";
+        let (session_path, cleanup) = write_session_fixture(
+            session_id,
+            &format!(
+                r#"{{
+  "agent:main:main": {{
+    "sessionId": "{session_id}",
+    "deliveryContext": {{
+      "channel": "discord",
+      "to": "channel:{channel_id}"
+    }},
+    "origin": {{
+      "provider": "discord",
+      "to": "channel:{channel_id}"
+    }}
+  }}
+}}"#
+            ),
+        );
+        let line = r#"{"type":"message","id":"60167cca","parentId":"1f5ac5f2","timestamp":"2026-03-07T09:31:19.656Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_a","name":"read","arguments":{"file_path":"/tmp/a"}}],"stopReason":"toolUse","timestamp":1772875879655}}"#;
+        let events = normalize_many_with_source(line, Some(&session_path));
+
+        let (lookup, request_rx, release_tx) = BlockingDiscordLookup::new();
+        let mut app = App::with_session_labels(
+            filters(),
+            30,
+            SessionLabelResolver::with_lookup(chrono::Duration::minutes(5), lookup),
+        );
+        for event in events {
+            let ts = event.timestamp.expect("timestamp");
+            app.ingest_event(event, ts);
+        }
+
+        assert_eq!(
+            request_rx
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("request"),
+            channel_id
+        );
+        release_tx
+            .send(Ok("ops-war-room".to_string()))
+            .expect("release lookup");
+        wait_for(|| app.refresh_session_labels(Utc::now()));
+
+        app.current_tab = Tab::Events;
+        app.tab_state_mut(Tab::Events).selected = app
+            .visible_rows(Tab::Events)
+            .first()
+            .map(|row| row.key.clone());
+
+        let rendered = render_string(&mut app).expect("rendered");
+        let inspector = inspector_string(&app);
+        assert!(rendered.contains("surface"));
+        assert!(rendered.contains("#ops-war-room"));
+        assert!(inspector.contains("Surface: #ops-war-room"));
+        assert!(inspector.contains(&format!("Session ID: {session_id}")));
+        assert!(inspector.contains(&format!("Discord Channel ID: {channel_id}")));
+
+        cleanup();
+    }
+
+    #[test]
+    fn discord_transcript_routing_survives_later_non_discord_events() {
+        let source_path = std::path::Path::new("/tmp/b18666a8-b5d5-4e92-a7a3-a2d1e72ac6f8.jsonl");
+        let discord_line = r#"{"type":"message","id":"03db303a","parentId":"fa2536d8","timestamp":"2026-03-08T14:18:38.017Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_message|fc_test","name":"message","arguments":{"action":"send","channel":"discord","target":"1477636729950179490","message":"done"}}]}}"#;
+        let follow_up_line = r#"{"type":"message","id":"a5c4a17f","parentId":"44293b2d","timestamp":"2026-03-08T14:28:37.914Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_read|fc_test","name":"read","arguments":{"file_path":"/tmp/a"}}]}}"#;
+
+        let (lookup, request_rx, release_tx) = BlockingDiscordLookup::new();
+        let mut app = App::with_session_labels(
+            filters(),
+            30,
+            SessionLabelResolver::with_lookup(chrono::Duration::minutes(5), lookup),
+        );
+        for raw in [discord_line, follow_up_line] {
+            for event in normalize_many_with_source(raw, Some(source_path)) {
+                let ts = event.timestamp.expect("timestamp");
+                app.ingest_event(event, ts);
+            }
+        }
+
+        assert_eq!(
+            request_rx
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("request"),
+            "1477636729950179490"
+        );
+        release_tx
+            .send(Ok("ops-war-room".to_string()))
+            .expect("release lookup");
+        wait_for(|| app.refresh_session_labels(Utc::now()));
+
+        app.current_tab = Tab::Events;
+        app.tab_state_mut(Tab::Events).selected = app
+            .visible_rows(Tab::Events)
+            .into_iter()
+            .find(|row| row.searchable.contains("read"))
+            .map(|row| row.key)
+            .or_else(|| {
+                app.visible_rows(Tab::Events)
+                    .first()
+                    .map(|row| row.key.clone())
+            });
+
+        let rendered = render_string(&mut app).expect("rendered");
+        assert!(rendered.contains("surface"));
+        assert!(rendered.contains("#ops-war-room"));
+        assert!(rendered.contains("Surface: #ops-war-room"));
+        assert!(!rendered.contains("Surface: b18666a8"));
+
+        let inspector = inspector_string(&app);
+        assert!(inspector.contains("Surface: #ops-war-room"));
+        assert!(inspector.contains("Session ID: b18666a8-b5d5-4e92-a7a3-a2d1e72ac6f8"));
     }
 }

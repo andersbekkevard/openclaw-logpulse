@@ -100,6 +100,12 @@ pub fn derive_routing_metadata(value: &Value, session_key: Option<&str>) -> Sess
     let mut issues = Vec::new();
     let mut provider_candidates = collect_candidates(value, PROVIDER_PATHS, false);
     let mut channel_candidates = collect_candidates(value, CHANNEL_ID_PATHS, true);
+    collect_transcript_discord_candidates(
+        value,
+        &mut provider_candidates,
+        &mut channel_candidates,
+        &mut issues,
+    );
 
     if let Some(session_key) = session_key {
         if session_key_mentions_discord(session_key) {
@@ -298,6 +304,90 @@ fn select_candidate(
     None
 }
 
+fn collect_transcript_discord_candidates(
+    value: &Value,
+    provider_candidates: &mut Vec<Candidate>,
+    channel_candidates: &mut Vec<Candidate>,
+    issues: &mut Vec<SessionRoutingIssue>,
+) {
+    let Some(message) = value.get("message") else {
+        return;
+    };
+
+    if let Some(content) = message.get("content").and_then(Value::as_array) {
+        for (idx, item) in content.iter().enumerate() {
+            if item.get("type").and_then(Value::as_str) != Some("toolCall") {
+                continue;
+            }
+            if item.get("name").and_then(Value::as_str) != Some("message") {
+                continue;
+            }
+
+            let Some(arguments) = item.get("arguments") else {
+                continue;
+            };
+            let Some(channel) = arguments.get("channel").and_then(value_to_string) else {
+                continue;
+            };
+            if !channel.eq_ignore_ascii_case("discord") {
+                continue;
+            }
+
+            let source_prefix = format!("message.content[{idx}].arguments");
+            provider_candidates.push(Candidate::new(
+                "discord",
+                format!("{source_prefix}.channel"),
+            ));
+            collect_channel_candidate(
+                arguments.get("target"),
+                &format!("{source_prefix}.target"),
+                channel_candidates,
+                issues,
+            );
+        }
+    }
+
+    if message.get("toolName").and_then(Value::as_str) == Some("message") {
+        if let Some(channel_id) = get_value_by_path(message, &["details", "result", "channelId"]) {
+            let source = "message.details.result.channelId";
+            provider_candidates.push(Candidate::new("discord", source));
+            collect_channel_candidate(Some(channel_id), source, channel_candidates, issues);
+        } else if let Some(channel_id) =
+            get_value_by_path(message, &["details", "result", "channel_id"])
+        {
+            let source = "message.details.result.channel_id";
+            provider_candidates.push(Candidate::new("discord", source));
+            collect_channel_candidate(Some(channel_id), source, channel_candidates, issues);
+        }
+    }
+}
+
+fn collect_channel_candidate(
+    raw_value: Option<&Value>,
+    source: &str,
+    channel_candidates: &mut Vec<Candidate>,
+    issues: &mut Vec<SessionRoutingIssue>,
+) {
+    let Some(raw) = raw_value.and_then(value_to_string) else {
+        return;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return;
+    }
+
+    if is_valid_discord_channel_id(raw) {
+        channel_candidates.push(Candidate::new(raw, source));
+        return;
+    }
+
+    issues.push(SessionRoutingIssue {
+        kind: RoutingIssueKind::Malformed,
+        field: "channel_id".to_string(),
+        detail: format!("{source} is not a numeric snowflake: {raw}"),
+    });
+}
+
 fn session_key_mentions_discord(session_key: &str) -> bool {
     session_key
         .split(':')
@@ -453,6 +543,71 @@ mod tests {
 
         assert!(routing.provider.is_none());
         assert_eq!(routing.channel_id.as_deref(), Some("1234567890"));
+        assert!(routing.issues.is_empty());
+    }
+
+    #[test]
+    fn derives_discord_routing_from_message_tool_call_arguments() {
+        let routing = derive_routing_metadata(
+            &json!({
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "toolCall",
+                        "name": "message",
+                        "arguments": {
+                            "action": "send",
+                            "channel": "discord",
+                            "target": "123456789012345678"
+                        }
+                    }]
+                }
+            }),
+            None,
+        );
+
+        assert_eq!(routing.provider.as_deref(), Some("discord"));
+        assert_eq!(routing.channel_id.as_deref(), Some("123456789012345678"));
+        assert_eq!(
+            routing.provider_source.as_deref(),
+            Some("message.content[0].arguments.channel")
+        );
+        assert_eq!(
+            routing.channel_id_source.as_deref(),
+            Some("message.content[0].arguments.target")
+        );
+        assert!(routing.issues.is_empty());
+    }
+
+    #[test]
+    fn derives_discord_routing_from_message_tool_result_payload() {
+        let routing = derive_routing_metadata(
+            &json!({
+                "type": "message",
+                "message": {
+                    "role": "toolResult",
+                    "toolName": "message",
+                    "details": {
+                        "result": {
+                            "channelId": "123456789012345678"
+                        }
+                    }
+                }
+            }),
+            None,
+        );
+
+        assert_eq!(routing.provider.as_deref(), Some("discord"));
+        assert_eq!(routing.channel_id.as_deref(), Some("123456789012345678"));
+        assert_eq!(
+            routing.provider_source.as_deref(),
+            Some("message.details.result.channelId")
+        );
+        assert_eq!(
+            routing.channel_id_source.as_deref(),
+            Some("message.details.result.channelId")
+        );
         assert!(routing.issues.is_empty());
     }
 

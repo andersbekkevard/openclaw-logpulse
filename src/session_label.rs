@@ -17,10 +17,12 @@ impl SessionLabelInput {
     pub fn from_event(event: &NormalizedEvent) -> Option<Self> {
         Some(Self {
             session_id: event.durable_session_id()?.to_string(),
-            raw_label: event
-                .session_label()
-                .cloned()
-                .unwrap_or_else(|| event.durable_session_id().unwrap_or("<unknown>").to_string()),
+            raw_label: event.session_label().cloned().unwrap_or_else(|| {
+                event
+                    .durable_session_id()
+                    .unwrap_or("<unknown>")
+                    .to_string()
+            }),
             routing: event.routing.clone(),
         })
     }
@@ -149,12 +151,17 @@ impl SessionLabelResolver {
     }
 
     pub fn observe_session(&mut self, input: SessionLabelInput, now: DateTime<Utc>) -> bool {
+        let merged = self
+            .sessions
+            .get(&input.session_id)
+            .map(|existing| merge_session_input(existing, input.clone()))
+            .unwrap_or_else(|| input.clone());
         let changed = self
             .sessions
-            .insert(input.session_id.clone(), input.clone())
+            .insert(input.session_id.clone(), merged.clone())
             .as_ref()
-            != Some(&input);
-        self.ensure_lookup(&input, now) || changed
+            != Some(&merged);
+        self.ensure_lookup(&merged, now) || changed
     }
 
     pub fn refresh(&mut self, now: DateTime<Utc>) -> bool {
@@ -202,7 +209,10 @@ impl SessionLabelResolver {
             return self.state_for_input(&input);
         }
         resolved_non_discord(
-            event.session_label().map(|value| value.as_str()).unwrap_or("-"),
+            event
+                .session_label()
+                .map(|value| value.as_str())
+                .unwrap_or("-"),
         )
     }
 
@@ -325,6 +335,28 @@ fn pending_display(channel_id: &str) -> String {
 
 fn failed_display(channel_id: &str) -> String {
     format!("#{channel_id}")
+}
+
+fn merge_session_input(
+    existing: &SessionLabelInput,
+    incoming: SessionLabelInput,
+) -> SessionLabelInput {
+    if session_input_rank(existing) > session_input_rank(&incoming) {
+        existing.clone()
+    } else {
+        incoming
+    }
+}
+
+fn session_input_rank(input: &SessionLabelInput) -> u8 {
+    match (
+        input.routing.is_discord(),
+        input.routing.channel_id.is_some(),
+    ) {
+        (true, true) => 3,
+        (true, false) => 2,
+        (false, _) => 1,
+    }
 }
 
 #[cfg(test)]
@@ -455,7 +487,10 @@ mod tests {
         let now = Utc::now();
 
         assert!(resolver.observe_session(
-            input("agent:main:discord:channel:1234567890", discord_routing(Some("1234567890"))),
+            input(
+                "agent:main:discord:channel:1234567890",
+                discord_routing(Some("1234567890"))
+            ),
             now,
         ));
 
@@ -467,7 +502,9 @@ mod tests {
             }
         );
         assert_eq!(
-            request_rx.recv_timeout(StdDuration::from_secs(1)).expect("request"),
+            request_rx
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("request"),
             "1234567890"
         );
 
@@ -499,7 +536,10 @@ mod tests {
         );
         let now = Utc::now();
         resolver.observe_session(
-            input("agent:main:discord:channel:1234567890", discord_routing(Some("1234567890"))),
+            input(
+                "agent:main:discord:channel:1234567890",
+                discord_routing(Some("1234567890")),
+            ),
             now,
         );
 
@@ -514,7 +554,10 @@ mod tests {
         );
 
         resolver.observe_session(
-            input("agent:main:discord:channel:1234567890", discord_routing(Some("1234567890"))),
+            input(
+                "agent:main:discord:channel:1234567890",
+                discord_routing(Some("1234567890")),
+            ),
             now + Duration::minutes(1),
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -550,7 +593,10 @@ mod tests {
             DiscordLookupError::missing_token("set LOGPULSE_DISCORD_TOKEN"),
         );
         resolver.observe_session(
-            input("agent:main:discord:channel:1234567890", discord_routing(Some("1234567890"))),
+            input(
+                "agent:main:discord:channel:1234567890",
+                discord_routing(Some("1234567890")),
+            ),
             Utc::now(),
         );
 
@@ -575,7 +621,10 @@ mod tests {
             DiscordLookupError::missing_config("discord lookup disabled"),
         );
         resolver.observe_session(
-            input("agent:main:discord:channel:1234567890", discord_routing(Some("1234567890"))),
+            input(
+                "agent:main:discord:channel:1234567890",
+                discord_routing(Some("1234567890")),
+            ),
             Utc::now(),
         );
 
@@ -596,14 +645,20 @@ mod tests {
         );
         let now = Utc::now();
         resolver.observe_session(
-            input("agent:main:discord:channel:1234567890", discord_routing(Some("1234567890"))),
+            input(
+                "agent:main:discord:channel:1234567890",
+                discord_routing(Some("1234567890")),
+            ),
             now,
         );
         wait_for(|| resolver.refresh(Utc::now()));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         resolver.observe_session(
-            input("agent:main:discord:channel:1234567890", discord_routing(Some("1234567890"))),
+            input(
+                "agent:main:discord:channel:1234567890",
+                discord_routing(Some("1234567890")),
+            ),
             now + Duration::milliseconds(500),
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -613,6 +668,42 @@ mod tests {
             resolver.refresh(Utc::now());
             calls.load(Ordering::SeqCst) == 2
         });
+    }
+
+    #[test]
+    fn preserves_discord_channel_mapping_when_later_events_omit_routing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut resolver = SessionLabelResolver::with_lookup(
+            Duration::minutes(5),
+            ScriptedLookup::immediate(Ok("ops-war-room".to_string()), calls.clone()),
+        );
+        let now = Utc::now();
+        resolver.observe_session(
+            input(
+                "b18666a8-1234-1234-1234-123456789abc",
+                discord_routing(Some("1234567890")),
+            ),
+            now,
+        );
+        wait_for(|| resolver.refresh(Utc::now()));
+
+        resolver.observe_session(
+            input(
+                "b18666a8-1234-1234-1234-123456789abc",
+                SessionRoutingMetadata::default(),
+            ),
+            now + Duration::seconds(1),
+        );
+
+        assert_eq!(
+            resolver.state_for_session("session-1", None),
+            SessionLabelState::Resolved {
+                display: "#ops-war-room".to_string(),
+                source: SessionLabelSource::Discord,
+                channel_id: Some("1234567890".to_string()),
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
