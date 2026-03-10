@@ -1,6 +1,7 @@
 mod cli;
 mod discovery;
 mod event;
+mod model;
 mod normalizer;
 mod output;
 mod parser;
