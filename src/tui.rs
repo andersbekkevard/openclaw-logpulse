@@ -3,7 +3,7 @@ use crate::event::{NormalizedEvent, Severity, TimeFilter, ToolEventKind};
 use crate::normalizer::normalize_many_with_source;
 use crate::projection::{
     CallStatus, CorrelatedCall, HealthConfig, HealthStatus, MatchConfidence, ProjectionFilter,
-    ProjectionStore, SessionSummary,
+    ProjectionStore, SessionLabelKind, SessionSummary,
 };
 use crate::session_label::{SessionLabelInput, SessionLabelResolver};
 use crate::stale::{HeartbeatSummary, StaleTracker, StaleWarning};
@@ -32,54 +32,55 @@ const DRAIN_PER_TICK: usize = 128;
 const MISSING_TTL_SECONDS: u64 = 30;
 const PREVIEW_LEN: usize = 72;
 const SESSION_LABEL_CACHE_TTL_MINUTES: i64 = 15;
+const SCROLL_OFF: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Tab {
-    Events,
-    Calls,
     Sessions,
+    Calls,
+    Events,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::Events, Tab::Calls, Tab::Sessions];
+    const ALL: [Tab; 3] = [Tab::Sessions, Tab::Calls, Tab::Events];
 
     fn title(self) -> &'static str {
         match self {
-            Tab::Events => "Events",
-            Tab::Calls => "Correlated Tool Calls",
+            Tab::Calls => "Tool Calls",
             Tab::Sessions => "Sessions",
+            Tab::Events => "Events",
         }
     }
 
     fn short_title(self) -> &'static str {
         match self {
-            Tab::Events => "Events",
             Tab::Calls => "Tool Calls",
             Tab::Sessions => "Sessions",
+            Tab::Events => "Events",
         }
     }
 
     fn index(self) -> usize {
         match self {
-            Tab::Events => 0,
+            Tab::Sessions => 0,
             Tab::Calls => 1,
-            Tab::Sessions => 2,
+            Tab::Events => 2,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Tab::Events => Tab::Sessions,
-            Tab::Calls => Tab::Events,
-            Tab::Sessions => Tab::Calls,
+            Tab::Sessions => Tab::Events,
+            Tab::Calls => Tab::Sessions,
+            Tab::Events => Tab::Calls,
         }
     }
 
     fn next(self) -> Self {
         match self {
-            Tab::Events => Tab::Calls,
-            Tab::Calls => Tab::Sessions,
-            Tab::Sessions => Tab::Events,
+            Tab::Sessions => Tab::Calls,
+            Tab::Calls => Tab::Events,
+            Tab::Events => Tab::Sessions,
         }
     }
 }
@@ -94,8 +95,8 @@ enum EntityKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FollowMode {
-    Live,
-    Pinned,
+    Follow,
+    Browse,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -119,7 +120,7 @@ impl Default for TabStateModel {
         Self {
             selected: None,
             scroll_offset: 0,
-            follow_mode: FollowMode::Live,
+            follow_mode: FollowMode::Follow,
             unseen_count: 0,
             search_match_index: 0,
             scope: DrilldownScope::default(),
@@ -136,7 +137,7 @@ struct RouteSnapshot {
 #[derive(Clone, Debug)]
 struct DetailState {
     entity: EntityKey,
-    scroll: u16,
+    scroll: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +211,7 @@ enum ActiveLayer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     Close,
+    GotoTopPrefix,
     NextRow,
     PreviousRow,
     FirstRow,
@@ -285,7 +287,7 @@ struct KeyBinding {
 const WORKSPACE_ONLY: &[ActiveLayer] = &[ActiveLayer::Workspace];
 const HELP_ONLY: &[ActiveLayer] = &[ActiveLayer::Help];
 const WORKSPACE_AND_DETAIL: &[ActiveLayer] = &[ActiveLayer::Workspace, ActiveLayer::Detail];
-const ALL_TABS: &[Tab] = &[Tab::Events, Tab::Calls, Tab::Sessions];
+const ALL_TABS: &[Tab] = &[Tab::Sessions, Tab::Calls, Tab::Events];
 const EVENTS_ONLY: &[Tab] = &[Tab::Events];
 
 const KEY_BINDINGS: &[KeyBinding] = &[
@@ -348,16 +350,16 @@ const KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         matcher: KeyMatcher::Char('g'),
-        action: Action::FirstRow,
-        description: "Jump to newest row",
-        layers: WORKSPACE_ONLY,
+        action: Action::GotoTopPrefix,
+        description: "Jump to top (press again)",
+        layers: WORKSPACE_AND_DETAIL,
         tabs: ALL_TABS,
     },
     KeyBinding {
         matcher: KeyMatcher::Char('G'),
         action: Action::LastRow,
         description: "Jump to oldest row",
-        layers: WORKSPACE_ONLY,
+        layers: WORKSPACE_AND_DETAIL,
         tabs: ALL_TABS,
     },
     KeyBinding {
@@ -383,29 +385,29 @@ const KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         matcher: KeyMatcher::Char('1'),
-        action: Action::TabEvents,
-        description: "Jump to Events",
-        layers: WORKSPACE_ONLY,
-        tabs: ALL_TABS,
-    },
-    KeyBinding {
-        matcher: KeyMatcher::Char('2'),
-        action: Action::TabCalls,
-        description: "Jump to Correlated Tool Calls",
-        layers: WORKSPACE_ONLY,
-        tabs: ALL_TABS,
-    },
-    KeyBinding {
-        matcher: KeyMatcher::Char('3'),
         action: Action::TabSessions,
         description: "Jump to Sessions",
         layers: WORKSPACE_ONLY,
         tabs: ALL_TABS,
     },
     KeyBinding {
+        matcher: KeyMatcher::Char('2'),
+        action: Action::TabCalls,
+        description: "Jump to Tool Calls",
+        layers: WORKSPACE_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Char('3'),
+        action: Action::TabEvents,
+        description: "Jump to Events",
+        layers: WORKSPACE_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
         matcher: KeyMatcher::Char('f'),
         action: Action::ResumeLive,
-        description: "Resume LIVE",
+        description: "Resume FOLLOW",
         layers: WORKSPACE_ONLY,
         tabs: ALL_TABS,
     },
@@ -485,8 +487,13 @@ struct App {
     route_stack: Vec<RouteSnapshot>,
     detail: Option<DetailState>,
     help_open: bool,
-    help_scroll: u16,
+    help_scroll: usize,
+    awaiting_gg: bool,
     filters: WorkspaceFilters,
+    detail_view_width: u16,
+    detail_view_height: u16,
+    help_view_width: u16,
+    help_view_height: u16,
     health: HealthConfig,
     next_notice_id: u64,
     now: DateTime<Utc>,
@@ -514,7 +521,7 @@ impl App {
             session_labels,
             notices: Vec::new(),
             latest_heartbeat: None,
-            current_tab: Tab::Events,
+            current_tab: Tab::Sessions,
             tabs: [
                 TabStateModel::default(),
                 TabStateModel::default(),
@@ -524,7 +531,12 @@ impl App {
             detail: None,
             help_open: false,
             help_scroll: 0,
+            awaiting_gg: false,
             filters,
+            detail_view_width: 0,
+            detail_view_height: 0,
+            help_view_width: 0,
+            help_view_height: 0,
             health: HealthConfig {
                 stale_after: chrono::Duration::seconds(stale_after_seconds as i64),
                 ..HealthConfig::default()
@@ -640,7 +652,7 @@ impl App {
                 continue;
             }
 
-            if state.follow_mode == FollowMode::Live {
+            if state.follow_mode == FollowMode::Follow {
                 state.selected = after_keys.first().cloned();
                 state.scroll_offset = 0;
                 state.unseen_count = 0;
@@ -992,7 +1004,7 @@ impl App {
     fn resume_live(&mut self) {
         let rows = self.visible_rows(self.current_tab);
         let state = self.current_tab_state_mut();
-        state.follow_mode = FollowMode::Live;
+        state.follow_mode = FollowMode::Follow;
         state.unseen_count = 0;
         state.scroll_offset = 0;
         state.selected = rows.first().map(|row| row.key.clone());
@@ -1006,9 +1018,9 @@ impl App {
         let current_index = self.selected_index(self.current_tab, &rows).unwrap_or(0) as isize;
         let next_index = (current_index + delta).clamp(0, rows.len().saturating_sub(1) as isize);
         let state = self.current_tab_state_mut();
-        state.follow_mode = FollowMode::Pinned;
+        state.follow_mode = FollowMode::Browse;
         state.selected = rows.get(next_index as usize).map(|row| row.key.clone());
-        state.scroll_offset = next_index.saturating_sub(3) as usize;
+        state.scroll_offset = list_scroll_offset(next_index as usize, SCROLL_OFF);
     }
 
     fn jump_to(&mut self, index: usize) {
@@ -1018,14 +1030,14 @@ impl App {
         }
         let target = index.min(rows.len().saturating_sub(1));
         let state = self.current_tab_state_mut();
-        state.follow_mode = FollowMode::Pinned;
+        state.follow_mode = FollowMode::Browse;
         state.selected = rows.get(target).map(|row| row.key.clone());
-        state.scroll_offset = target.saturating_sub(3);
+        state.scroll_offset = list_scroll_offset(target, SCROLL_OFF);
     }
 
     fn switch_tab(&mut self, tab: Tab) {
         self.current_tab = tab;
-        if self.current_tab_state().follow_mode == FollowMode::Live {
+        if self.current_tab_state().follow_mode == FollowMode::Follow {
             let rows = self.visible_rows(tab);
             self.tab_state_mut(tab).selected = rows.first().map(|row| row.key.clone());
         }
@@ -1069,19 +1081,19 @@ impl App {
                     session_id: Some(session_id),
                     call_entity_id: None,
                 };
-                let selected = {
-                    let mut preview = self.tabs.clone();
-                    preview[Tab::Calls.index()].scope = scope.clone();
-                    preview[Tab::Calls.index()].follow_mode = FollowMode::Live;
-                    let original = std::mem::replace(&mut self.tabs, preview);
-                    let rows = self.visible_rows(Tab::Calls);
-                    self.tabs = original;
-                    rows.first().map(|row| row.key.clone())
-                };
-                let target = self.tab_state_mut(Tab::Calls);
-                target.scope = scope;
-                target.follow_mode = FollowMode::Live;
-                target.unseen_count = 0;
+                    let selected = {
+                        let mut preview = self.tabs.clone();
+                        preview[Tab::Calls.index()].scope = scope.clone();
+                        preview[Tab::Calls.index()].follow_mode = FollowMode::Follow;
+                        let original = std::mem::replace(&mut self.tabs, preview);
+                        let rows = self.visible_rows(Tab::Calls);
+                        self.tabs = original;
+                        rows.first().map(|row| row.key.clone())
+                    };
+                    let target = self.tab_state_mut(Tab::Calls);
+                    target.scope = scope;
+                    target.follow_mode = FollowMode::Follow;
+                    target.unseen_count = 0;
                 target.scroll_offset = 0;
                 target.selected = selected;
                 self.current_tab = Tab::Calls;
@@ -1099,18 +1111,18 @@ impl App {
                     session_id: Some(call.session_id.clone()),
                     call_entity_id: Some(call.call_entity_id.clone()),
                 };
-                let selected = {
-                    let mut preview = self.tabs.clone();
-                    preview[Tab::Events.index()].scope = scope.clone();
-                    preview[Tab::Events.index()].follow_mode = FollowMode::Pinned;
-                    let original = std::mem::replace(&mut self.tabs, preview);
-                    let rows = self.visible_rows(Tab::Events);
-                    self.tabs = original;
-                    rows.first().map(|row| row.key.clone())
-                };
-                let target = self.tab_state_mut(Tab::Events);
-                target.scope = scope;
-                target.follow_mode = FollowMode::Pinned;
+                    let selected = {
+                        let mut preview = self.tabs.clone();
+                        preview[Tab::Events.index()].scope = scope.clone();
+                        preview[Tab::Events.index()].follow_mode = FollowMode::Browse;
+                        let original = std::mem::replace(&mut self.tabs, preview);
+                        let rows = self.visible_rows(Tab::Events);
+                        self.tabs = original;
+                        rows.first().map(|row| row.key.clone())
+                    };
+                    let target = self.tab_state_mut(Tab::Events);
+                    target.scope = scope;
+                    target.follow_mode = FollowMode::Browse;
                 target.unseen_count = 0;
                 target.scroll_offset = 0;
                 target.selected = selected;
@@ -1121,6 +1133,7 @@ impl App {
     }
 
     fn open_detail(&mut self) {
+        self.awaiting_gg = false;
         if let Some(selected) = self.current_tab_state().selected.clone() {
             self.detail = Some(DetailState {
                 entity: selected,
@@ -1278,6 +1291,20 @@ impl App {
             kv_line("Entity ID", &call.call_entity_id),
             kv_line("Session", &display_label),
             kv_line("Session ID", &call.session_id),
+            match call.session_label_info.kind {
+                SessionLabelKind::DiscordChannelId => {
+                    kv_line(
+                        "Discord Channel ID",
+                        call.session_label_info
+                            .channel_id
+                            .as_deref()
+                            .unwrap_or("-"),
+                    )
+                }
+                SessionLabelKind::StableSessionId => {
+                    kv_line("Session Label Source", "non-discord")
+                }
+            },
             kv_line("Status", call_status_label(call.status)),
             kv_line(
                 "Confidence",
@@ -1328,7 +1355,7 @@ impl App {
         };
         let display_label =
             self.display_session_label(Some(&session.session_id), Some(&session.session_label));
-        Text::from(vec![
+        let mut lines = vec![
             title_line("SESSION", Color::Cyan),
             kv_line("Session ID", &session.session_id),
             kv_line("Label", &display_label),
@@ -1358,7 +1385,20 @@ impl App {
             kv_line("Open calls", &session.open_call_count.to_string()),
             kv_line("Stale calls", &session.stale_call_count.to_string()),
             kv_line("Severity", severity_label(session.derived_severity)),
-        ])
+        ];
+
+        if session.session_label_info.kind == SessionLabelKind::DiscordChannelId {
+            lines.push(kv_line(
+                "Discord Channel ID",
+                session
+                    .session_label_info
+                    .channel_id
+                    .as_deref()
+                    .unwrap_or("-"),
+            ));
+        }
+
+        Text::from(lines)
     }
 
     fn breadcrumb(&self) -> String {
@@ -1435,8 +1475,8 @@ impl App {
             kv_line(
                 "State",
                 match self.current_tab_state().follow_mode {
-                    FollowMode::Live => "LIVE",
-                    FollowMode::Pinned => "PINNED",
+                    FollowMode::Follow => "FOLLOW",
+                    FollowMode::Browse => "BROWSE",
                 },
             ),
             kv_line(
@@ -1469,6 +1509,50 @@ impl App {
             ]));
         }
         Text::from(lines)
+    }
+
+    fn detail_text_lines(&self) -> usize {
+        self.inspector_text().to_string().lines().count()
+    }
+
+    fn set_detail_viewport(&mut self, area: Rect) {
+        self.detail_view_width = area.width;
+        self.detail_view_height = area.height;
+    }
+
+    fn set_help_viewport(&mut self, area: Rect) {
+        self.help_view_width = area.width;
+        self.help_view_height = area.height;
+    }
+
+    fn detail_visible_size(&self) -> Option<(usize, usize)> {
+        let width = self.detail_view_width.saturating_sub(2);
+        let height = self.detail_view_height.saturating_sub(2);
+        (width > 0 && height > 0).then_some((width as usize, height as usize))
+    }
+
+    fn help_visible_size(&self) -> Option<(usize, usize)> {
+        let width = self.help_view_width.saturating_sub(2);
+        let height = self.help_view_height.saturating_sub(2);
+        (width > 0 && height > 0).then_some((width as usize, height as usize))
+    }
+
+    fn help_text_lines(&self) -> usize {
+        self.help_lines().to_string().lines().count()
+    }
+
+    fn detail_scroll_limit(&self) -> usize {
+        let Some((width, height)) = self.detail_visible_size() else {
+            return self.detail_text_lines().saturating_sub(1);
+        };
+        rendered_text_scroll_limit(&self.inspector_text(), width, height)
+    }
+
+    fn help_scroll_limit(&self) -> usize {
+        let Some((width, height)) = self.help_visible_size() else {
+            return self.help_text_lines().saturating_sub(1);
+        };
+        rendered_text_scroll_limit(&self.help_lines(), width, height)
     }
 }
 
@@ -1534,7 +1618,7 @@ fn run_app(
 
             drain_multi_tailer(&mut tailer, &mut tracker, &mut app);
             app.refresh_session_labels(Utc::now());
-            terminal.draw(|frame| render(frame, &app))?;
+            terminal.draw(|frame| render(frame, &mut app))?;
         }
 
         return Ok(());
@@ -1558,7 +1642,7 @@ fn run_app(
             );
             loop {
                 app.refresh_session_labels(Utc::now());
-                terminal.draw(|frame| render(frame, &app))?;
+                terminal.draw(|frame| render(frame, &mut app))?;
                 if handle_input(&mut app, ui_tick)? {
                     break;
                 }
@@ -1580,7 +1664,7 @@ fn run_app(
 
         drain_single_tailer(&mut tailer, &log_file, &mut tracker, &mut app);
         app.refresh_session_labels(Utc::now());
-        terminal.draw(|frame| render(frame, &app))?;
+        terminal.draw(|frame| render(frame, &mut app))?;
     }
 
     Ok(())
@@ -1614,6 +1698,19 @@ fn handle_input(app: &mut App, timeout: Duration) -> io::Result<bool> {
             return Ok(false);
         }
 
+        if app.awaiting_gg {
+            app.awaiting_gg = false;
+            if key.code == KeyCode::Char('g') {
+                return Ok(perform_action(app, Action::FirstRow));
+            }
+
+            if let Some(action) = resolve_action(app, &key) {
+                return Ok(perform_action(app, action));
+            }
+
+            return Ok(false);
+        }
+
         let Some(action) = resolve_action(app, &key) else {
             return Ok(false);
         };
@@ -1626,33 +1723,62 @@ fn handle_input(app: &mut App, timeout: Duration) -> io::Result<bool> {
 
 fn perform_action(app: &mut App, action: Action) -> bool {
     match action {
-        Action::Close => app.unwind_route(),
+        Action::Close => {
+            app.awaiting_gg = false;
+            app.unwind_route()
+        }
+        Action::GotoTopPrefix => {
+            app.awaiting_gg = true;
+            false
+        }
         Action::NextRow => {
+            app.awaiting_gg = false;
             app.move_selection(1);
             false
         }
         Action::PreviousRow => {
+            app.awaiting_gg = false;
             app.move_selection(-1);
             false
         }
         Action::FirstRow => {
-            app.jump_to(0);
+            app.awaiting_gg = false;
+            if app.help_open {
+                app.help_scroll = 0;
+            } else if app.detail.is_some() {
+                app.detail.as_mut().expect("detail").scroll = 0;
+            } else {
+                app.jump_to(0);
+            }
             false
         }
         Action::LastRow => {
-            let last = app.visible_rows(app.current_tab).len().saturating_sub(1);
-            app.jump_to(last);
+            app.awaiting_gg = false;
+            if app.help_open {
+                app.help_scroll = app.help_scroll_limit();
+            } else if let Some(max) = app.detail.as_ref().map(|_| app.detail_scroll_limit()) {
+                if let Some(detail) = app.detail.as_mut() {
+                    detail.scroll = max;
+                }
+            } else {
+                let last = app.visible_rows(app.current_tab).len().saturating_sub(1);
+                app.jump_to(last);
+            }
             false
         }
         Action::ScrollDown => {
+            app.awaiting_gg = false;
             if app.help_open {
-                app.help_scroll = app.help_scroll.saturating_add(1);
-            } else if let Some(detail) = app.detail.as_mut() {
-                detail.scroll = detail.scroll.saturating_add(1);
+                app.help_scroll = (app.help_scroll.saturating_add(1)).min(app.help_scroll_limit());
+            } else if let Some(max) = app.detail.as_ref().map(|_| app.detail_scroll_limit()) {
+                if let Some(detail) = app.detail.as_mut() {
+                    detail.scroll = (detail.scroll.saturating_add(1)).min(max);
+                }
             }
             false
         }
         Action::ScrollUp => {
+            app.awaiting_gg = false;
             if app.help_open {
                 app.help_scroll = app.help_scroll.saturating_sub(1);
             } else if let Some(detail) = app.detail.as_mut() {
@@ -1661,38 +1787,47 @@ fn perform_action(app: &mut App, action: Action) -> bool {
             false
         }
         Action::ResumeLive => {
+            app.awaiting_gg = false;
             app.resume_live();
             false
         }
         Action::PreviousTab => {
+            app.awaiting_gg = false;
             app.switch_tab(app.current_tab.previous());
             false
         }
         Action::NextTab => {
+            app.awaiting_gg = false;
             app.switch_tab(app.current_tab.next());
             false
         }
         Action::TabEvents => {
+            app.awaiting_gg = false;
             app.switch_tab(Tab::Events);
             false
         }
         Action::TabCalls => {
+            app.awaiting_gg = false;
             app.switch_tab(Tab::Calls);
             false
         }
         Action::TabSessions => {
+            app.awaiting_gg = false;
             app.switch_tab(Tab::Sessions);
             false
         }
         Action::Activate => {
             app.activate_selected();
+            app.awaiting_gg = false;
             false
         }
         Action::OpenDetail => {
             app.open_detail();
+            app.awaiting_gg = false;
             false
         }
         Action::ToggleHelp => {
+            app.awaiting_gg = false;
             app.help_open = !app.help_open;
             if app.help_open {
                 app.help_scroll = 0;
@@ -1753,7 +1888,7 @@ fn ingest_line(
     }
 }
 
-fn render(frame: &mut Frame, app: &App) {
+fn render(frame: &mut Frame, app: &mut App) {
     if app.detail.is_some() {
         render_detail(frame, frame.area(), app);
         if app.help_open {
@@ -1786,9 +1921,9 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         .into_iter()
         .map(|tab| {
             let state = app.tab_state(tab);
-            let live = match state.follow_mode {
-                FollowMode::Live => "LIVE",
-                FollowMode::Pinned => "PINNED",
+            let mode = match state.follow_mode {
+                FollowMode::Follow => "FOLLOW",
+                FollowMode::Browse => "BROWSE",
             };
             let unseen = if state.unseen_count == 0 {
                 String::new()
@@ -1804,7 +1939,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(Color::Gray)
             };
             Span::styled(
-                format!(" {} [{}{}] ", tab.short_title(), live, unseen),
+                format!(" {} [{}{}] ", tab.short_title(), mode, unseen),
                 style,
             )
         })
@@ -1938,8 +2073,21 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
-    let scroll = app.detail.as_ref().map(|detail| detail.scroll).unwrap_or(0);
+fn render_detail(frame: &mut Frame, area: Rect, app: &mut App) {
+    app.set_detail_viewport(area);
+    let detail_scroll_limit = app
+        .detail
+        .as_ref()
+        .map(|_| app.detail_scroll_limit())
+        .unwrap_or(0);
+    if let Some(detail) = app.detail.as_mut() {
+        detail.scroll = detail.scroll.min(detail_scroll_limit);
+    }
+    let scroll = app
+        .detail
+        .as_ref()
+        .map(|detail| detail.scroll.min(u16::MAX as usize))
+        .unwrap_or(0);
     let paragraph = Paragraph::new(app.inspector_text())
         .block(
             Block::default()
@@ -1947,7 +2095,7 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
                 .title(app.breadcrumb()),
         )
         .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+        .scroll((scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, area);
 }
 
@@ -1977,9 +2125,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_help(frame: &mut Frame, app: &App) {
+fn render_help(frame: &mut Frame, app: &mut App) {
     let popup = centered_rect(80, 70, frame.area());
     frame.render_widget(Clear, popup);
+    app.set_help_viewport(popup);
+    app.help_scroll = app.help_scroll.min(app.help_scroll_limit());
+    let help_scroll = app.help_scroll.min(u16::MAX as usize) as u16;
     let paragraph = Paragraph::new(app.help_lines())
         .block(
             Block::default()
@@ -1987,7 +2138,7 @@ fn render_help(frame: &mut Frame, app: &App) {
                 .title("Contextual Help"),
         )
         .wrap(Wrap { trim: false })
-        .scroll((app.help_scroll, 0));
+        .scroll((help_scroll, 0));
     frame.render_widget(paragraph, popup);
 }
 
@@ -2006,6 +2157,36 @@ fn centered_rect(horizontal_percent: u16, vertical_percent: u16, area: Rect) -> 
     ])
     .flex(Flex::Center)
     .split(vertical[1])[1]
+}
+
+fn rendered_text_scroll_limit(text: &Text, width: usize, height: usize) -> usize {
+    let visible_lines = rendered_text_lines(text, width);
+    if visible_lines == 0 || height == 0 {
+        return 0;
+    }
+    visible_lines.saturating_sub(height)
+}
+
+fn rendered_text_lines(text: &Text, width: usize) -> usize {
+    if width == 0 {
+        return text.to_string().lines().count();
+    }
+
+    let rendered = text.to_string();
+    rendered
+        .lines()
+        .map(|line| {
+            let len = line.to_string().chars().count().max(1);
+            (len + width - 1) / width
+        })
+        .sum()
+}
+
+fn list_scroll_offset(index: usize, scrolloff: usize) -> usize {
+    if index == 0 || scrolloff == 0 {
+        return 0;
+    }
+    index.saturating_sub(scrolloff)
 }
 
 fn kind_label(kind: &ToolEventKind) -> &'static str {
@@ -2390,8 +2571,27 @@ mod tests {
         );
     }
 
-    fn render_string(app: &App) -> io::Result<String> {
-        let backend = TestBackend::new(120, 40);
+    fn seed_many_events(app: &mut App, count: usize) {
+        for i in 0..count {
+            let event = event(
+                &format!("session-{i}"),
+                Some(&format!("label-{i}")),
+                "shell",
+                Some(&format!("call-{i}")),
+                if i % 2 == 0 {
+                    ToolEventKind::ToolCallStart
+                } else {
+                    ToolEventKind::ToolCallResult
+                },
+                &format!("2026-03-07T10:00:{i:02}Z"),
+            );
+            let ts = event.timestamp.unwrap();
+            app.ingest_event(event, ts);
+        }
+    }
+
+    fn render_string_with_size(app: &mut App, width: u16, height: u16) -> io::Result<String> {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend)?;
         terminal.draw(|frame| render(frame, app))?;
         let buffer = terminal.backend().buffer().clone();
@@ -2406,6 +2606,10 @@ mod tests {
         Ok(lines.join("\n"))
     }
 
+    fn render_string(app: &mut App) -> io::Result<String> {
+        render_string_with_size(app, 120, 40)
+    }
+
     #[test]
     fn tab_state_is_remembered_per_tab() {
         let mut app = app();
@@ -2414,7 +2618,7 @@ mod tests {
         app.switch_tab(Tab::Calls);
         app.move_selection(1);
         let calls_selected = app.tab_state(Tab::Calls).selected.clone();
-        assert_eq!(app.tab_state(Tab::Calls).follow_mode, FollowMode::Pinned);
+        assert_eq!(app.tab_state(Tab::Calls).follow_mode, FollowMode::Browse);
 
         app.switch_tab(Tab::Sessions);
         app.move_selection(1);
@@ -2476,8 +2680,9 @@ mod tests {
         let mut app = app();
         seed(&mut app);
 
+        app.current_tab = Tab::Events;
         app.tab_state_mut(Tab::Events).selected = Some(EntityKey::Event("event-3".to_string()));
-        app.current_tab_state_mut().follow_mode = FollowMode::Pinned;
+        app.current_tab_state_mut().follow_mode = FollowMode::Browse;
         app.open_detail();
         let before = app.selected_detail_entity().cloned();
 
@@ -2503,7 +2708,7 @@ mod tests {
         app.tab_state_mut(Tab::Events).selected = Some(EntityKey::Event("event-3".to_string()));
         app.open_detail();
 
-        let rendered = render_string(&app).expect("rendered");
+        let rendered = render_string(&mut app).expect("rendered");
         assert!(rendered.contains("Event Detail"));
         assert!(!rendered.contains("OpenClaw Logpulse"));
         assert!(!rendered.contains("Toggle contextual help"));
@@ -2515,19 +2720,19 @@ mod tests {
         seed(&mut test_app);
         test_app.help_open = true;
 
-        let rendered = render_string(&test_app).expect("rendered");
+        let rendered = render_string(&mut test_app).expect("rendered");
         assert!(rendered.contains("Contextual Help"));
-        assert!(rendered.contains("Events [LIVE]"));
+        assert!(rendered.contains("Sessions [FOLLOW]"));
         assert!(rendered.contains("Enter"));
         assert!(rendered.contains("Toggle contextual help"));
 
-        let before_scroll = render_string(&test_app).expect("before scroll");
+        let before_scroll = render_string(&mut test_app).expect("before scroll");
         assert_eq!(test_app.help_scroll, 0);
         assert!(!perform_action(&mut test_app, Action::ScrollDown));
         assert_eq!(test_app.help_scroll, 1);
         assert!(!perform_action(&mut test_app, Action::ScrollDown));
         assert_eq!(test_app.help_scroll, 2);
-        let after_scroll = render_string(&test_app).expect("after scroll");
+        let after_scroll = render_string(&mut test_app).expect("after scroll");
         assert_ne!(before_scroll, after_scroll);
 
         let binding = resolve_action(
@@ -2538,6 +2743,115 @@ mod tests {
             &KeyEvent::from(KeyCode::Char('?')),
         );
         assert_eq!(binding, Some(Action::ToggleHelp));
+    }
+
+    #[test]
+    fn tabs_are_reordered_with_numeric_and_navigation_bindings() {
+        let mut app = app();
+
+        assert_eq!(app.current_tab, Tab::Sessions);
+
+        assert_eq!(
+            resolve_action(&app, &KeyEvent::from(KeyCode::Char('1'))),
+            Some(Action::TabSessions)
+        );
+        assert_eq!(
+            resolve_action(&app, &KeyEvent::from(KeyCode::Char('2'))),
+            Some(Action::TabCalls)
+        );
+        assert_eq!(
+            resolve_action(&app, &KeyEvent::from(KeyCode::Char('3'))),
+            Some(Action::TabEvents)
+        );
+
+        perform_action(&mut app, Action::NextTab);
+        assert_eq!(app.current_tab, Tab::Calls);
+        perform_action(&mut app, Action::NextTab);
+        assert_eq!(app.current_tab, Tab::Events);
+        perform_action(&mut app, Action::PreviousTab);
+        assert_eq!(app.current_tab, Tab::Calls);
+    }
+
+    #[test]
+    fn gg_and_g_jump_in_list_and_detail() {
+        let mut app = app();
+        seed(&mut app);
+
+        app.current_tab = Tab::Sessions;
+        assert_eq!(app.current_tab, Tab::Sessions);
+
+        perform_action(&mut app, Action::NextRow);
+        let rows_after_move = app.visible_rows(Tab::Sessions);
+        assert!(rows_after_move.len() > 1);
+
+        perform_action(&mut app, Action::LastRow);
+        assert_eq!(
+            app.tab_state(Tab::Sessions).selected,
+            rows_after_move.last().map(|row| row.key.clone())
+        );
+
+        assert_eq!(resolve_action(&app, &KeyEvent::from(KeyCode::Char('g'))), Some(Action::GotoTopPrefix));
+        assert!(!perform_action(
+            &mut app,
+            Action::FirstRow
+        ));
+        assert_eq!(
+            app.tab_state(Tab::Sessions).selected,
+            rows_after_move.first().map(|row| row.key.clone())
+        );
+
+        let mut long_event = event(
+            "session-detail",
+            Some("session-detail-label"),
+            "shell",
+            Some("detail-call"),
+            ToolEventKind::ToolCallStart,
+            "2026-03-07T10:00:59Z",
+        );
+        long_event.message = Some("x".repeat(1200));
+        long_event.raw_line = format!("{{\"detail\":\"{}\"}}", "x".repeat(1200));
+        let ts = long_event.timestamp.unwrap();
+        app.ingest_event(long_event, ts);
+
+        app.current_tab = Tab::Events;
+        app.tab_state_mut(Tab::Events).selected = app.visible_rows(Tab::Events).first().map(|row| row.key.clone());
+        app.open_detail();
+
+        render_string_with_size(&mut app, 40, 10).expect("detail render");
+        let detail_limit = app.detail_scroll_limit();
+        assert!(detail_limit > 0);
+
+        perform_action(&mut app, Action::LastRow);
+        assert_eq!(app.detail.as_ref().unwrap().scroll, detail_limit);
+
+        if let Some(detail) = app.detail.as_mut() {
+            detail.scroll = detail.scroll.saturating_add(1000);
+        }
+
+        render_string_with_size(&mut app, 20, 6).expect("detail render narrow");
+        let at_bottom_after_resize = app.detail_scroll_limit();
+        assert_eq!(app.detail.as_ref().unwrap().scroll, at_bottom_after_resize);
+
+        let at_bottom_after_resize = app.detail.as_ref().unwrap().scroll;
+        perform_action(&mut app, Action::ScrollDown);
+        assert_eq!(app.detail.as_ref().unwrap().scroll, at_bottom_after_resize);
+    }
+
+    #[test]
+    fn help_scrolls_to_wrap_aware_bottom_and_stays_clamped() {
+        let mut app = app();
+        seed(&mut app);
+        app.help_open = true;
+
+        render_string_with_size(&mut app, 70, 12).expect("help render");
+        let limit = app.help_scroll_limit();
+        assert!(limit > 0);
+
+        assert!(!perform_action(&mut app, Action::LastRow));
+        assert_eq!(app.help_scroll, limit);
+
+        perform_action(&mut app, Action::ScrollDown);
+        assert_eq!(app.help_scroll, limit);
     }
 
     #[test]
@@ -2586,7 +2900,7 @@ mod tests {
         app.ingest_event(item, ts);
         app.switch_tab(Tab::Sessions);
 
-        let pending = render_string(&app).expect("pending render");
+        let pending = render_string(&mut app).expect("pending render");
         assert!(pending.contains("#1234567890 (resolving)"));
         assert_eq!(
             request_rx.recv_timeout(StdDuration::from_secs(1)).expect("request"),
@@ -2602,7 +2916,7 @@ mod tests {
             Some(EntityKey::Session("session-discord".to_string()));
         app.activate_selected();
 
-        let resolved = render_string(&app).expect("resolved render");
+        let resolved = render_string(&mut app).expect("resolved render");
         assert!(resolved.contains("#ops-war-room"));
         assert!(resolved.contains("session #ops-war-room"));
     }
