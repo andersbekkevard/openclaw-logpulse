@@ -669,14 +669,34 @@ impl App {
                 );
             }
 
-            if state
-                .selected
-                .as_ref()
-                .map(|selected| after_keys.iter().any(|candidate| candidate == selected))
-                != Some(true)
-            {
+            let Some(selected) = state.selected.clone() else {
                 state.selected = after_keys.first().cloned();
                 state.scroll_offset = 0;
+                continue;
+            };
+
+            let Some(after_index) = after_keys
+                .iter()
+                .position(|candidate| candidate == &selected)
+            else {
+                state.selected = after_keys.first().cloned();
+                state.scroll_offset = 0;
+                continue;
+            };
+
+            if let Some(previous_index) = before
+                .get(&tab)
+                .and_then(|previous| previous.iter().position(|candidate| candidate == &selected))
+            {
+                if after_index >= previous_index {
+                    state.scroll_offset = state
+                        .scroll_offset
+                        .saturating_add(after_index - previous_index);
+                } else {
+                    state.scroll_offset = state
+                        .scroll_offset
+                        .saturating_sub(previous_index - after_index);
+                }
             }
         }
     }
@@ -712,10 +732,8 @@ impl App {
             .event_rows(&self.projection_filter())
             .into_iter()
             .filter(|row| {
-                let display_label = self.display_session_label(
-                    row.session_id.as_deref(),
-                    row.session_label.as_deref(),
-                );
+                let display_label = self
+                    .display_session_label(row.session_id.as_deref(), row.session_label.as_deref());
                 if self.filters.stale_only {
                     return false;
                 }
@@ -738,10 +756,8 @@ impl App {
                 ])
             })
             .map(|row| {
-                let display_label = self.display_session_label(
-                    row.session_id.as_deref(),
-                    row.session_label.as_deref(),
-                );
+                let display_label = self
+                    .display_session_label(row.session_id.as_deref(), row.session_label.as_deref());
                 VisibleRow {
                     key: EntityKey::Event(row.event_ref.clone()),
                     searchable: [
@@ -926,7 +942,10 @@ impl App {
                             Some(ms) => format!("{ms}ms"),
                             None => "-".to_string(),
                         },
-                        truncate_display(call.message_preview.as_deref().unwrap_or("-"), PREVIEW_LEN),
+                        truncate_display(
+                            call.message_preview.as_deref().unwrap_or("-"),
+                            PREVIEW_LEN,
+                        ),
                     ],
                 }
             })
@@ -1039,7 +1058,11 @@ impl App {
         self.current_tab = tab;
         if self.current_tab_state().follow_mode == FollowMode::Follow {
             let rows = self.visible_rows(tab);
-            self.tab_state_mut(tab).selected = rows.first().map(|row| row.key.clone());
+            let target = self.tab_state_mut(tab);
+            target.follow_mode = FollowMode::Browse;
+            target.unseen_count = 0;
+            target.scroll_offset = 0;
+            target.selected = rows.first().map(|row| row.key.clone());
         }
     }
 
@@ -1081,19 +1104,19 @@ impl App {
                     session_id: Some(session_id),
                     call_entity_id: None,
                 };
-                    let selected = {
-                        let mut preview = self.tabs.clone();
-                        preview[Tab::Calls.index()].scope = scope.clone();
-                        preview[Tab::Calls.index()].follow_mode = FollowMode::Follow;
-                        let original = std::mem::replace(&mut self.tabs, preview);
-                        let rows = self.visible_rows(Tab::Calls);
-                        self.tabs = original;
-                        rows.first().map(|row| row.key.clone())
-                    };
-                    let target = self.tab_state_mut(Tab::Calls);
-                    target.scope = scope;
-                    target.follow_mode = FollowMode::Follow;
-                    target.unseen_count = 0;
+                let selected = {
+                    let mut preview = self.tabs.clone();
+                    preview[Tab::Calls.index()].scope = scope.clone();
+                    preview[Tab::Calls.index()].follow_mode = FollowMode::Browse;
+                    let original = std::mem::replace(&mut self.tabs, preview);
+                    let rows = self.visible_rows(Tab::Calls);
+                    self.tabs = original;
+                    rows.first().map(|row| row.key.clone())
+                };
+                let target = self.tab_state_mut(Tab::Calls);
+                target.scope = scope;
+                target.follow_mode = FollowMode::Browse;
+                target.unseen_count = 0;
                 target.scroll_offset = 0;
                 target.selected = selected;
                 self.current_tab = Tab::Calls;
@@ -1111,18 +1134,18 @@ impl App {
                     session_id: Some(call.session_id.clone()),
                     call_entity_id: Some(call.call_entity_id.clone()),
                 };
-                    let selected = {
-                        let mut preview = self.tabs.clone();
-                        preview[Tab::Events.index()].scope = scope.clone();
-                        preview[Tab::Events.index()].follow_mode = FollowMode::Browse;
-                        let original = std::mem::replace(&mut self.tabs, preview);
-                        let rows = self.visible_rows(Tab::Events);
-                        self.tabs = original;
-                        rows.first().map(|row| row.key.clone())
-                    };
-                    let target = self.tab_state_mut(Tab::Events);
-                    target.scope = scope;
-                    target.follow_mode = FollowMode::Browse;
+                let selected = {
+                    let mut preview = self.tabs.clone();
+                    preview[Tab::Events.index()].scope = scope.clone();
+                    preview[Tab::Events.index()].follow_mode = FollowMode::Browse;
+                    let original = std::mem::replace(&mut self.tabs, preview);
+                    let rows = self.visible_rows(Tab::Events);
+                    self.tabs = original;
+                    rows.first().map(|row| row.key.clone())
+                };
+                let target = self.tab_state_mut(Tab::Events);
+                target.scope = scope;
+                target.follow_mode = FollowMode::Browse;
                 target.unseen_count = 0;
                 target.scroll_offset = 0;
                 target.selected = selected;
@@ -1188,7 +1211,11 @@ impl App {
         let Some(event) = self.events_by_ref.get(event_ref) else {
             return Text::from("Missing event");
         };
-        let display_label = self.session_labels.state_for_event(event).display().to_string();
+        let display_label = self
+            .session_labels
+            .state_for_event(event)
+            .display()
+            .to_string();
         let mut lines = vec![title_line(
             &format!(
                 "{} {}",
@@ -1292,18 +1319,11 @@ impl App {
             kv_line("Session", &display_label),
             kv_line("Session ID", &call.session_id),
             match call.session_label_info.kind {
-                SessionLabelKind::DiscordChannelId => {
-                    kv_line(
-                        "Discord Channel ID",
-                        call.session_label_info
-                            .channel_id
-                            .as_deref()
-                            .unwrap_or("-"),
-                    )
-                }
-                SessionLabelKind::StableSessionId => {
-                    kv_line("Session Label Source", "non-discord")
-                }
+                SessionLabelKind::DiscordChannelId => kv_line(
+                    "Discord Channel ID",
+                    call.session_label_info.channel_id.as_deref().unwrap_or("-"),
+                ),
+                SessionLabelKind::StableSessionId => kv_line("Session Label Source", "non-discord"),
             },
             kv_line("Status", call_status_label(call.status)),
             kv_line(
@@ -1427,20 +1447,16 @@ impl App {
         parts.join(" / ")
     }
 
-    fn display_session_label(
-        &self,
-        session_id: Option<&str>,
-        raw_label: Option<&str>,
-    ) -> String {
+    fn display_session_label(&self, session_id: Option<&str>, raw_label: Option<&str>) -> String {
         match session_id {
             Some(session_id) => self
                 .session_labels
                 .state_for_session(session_id, raw_label)
                 .display()
                 .to_string(),
-            None => crate::session_identity::shorten_non_discord_session_label(
-                raw_label.unwrap_or("-"),
-            ),
+            None => {
+                crate::session_identity::shorten_non_discord_session_label(raw_label.unwrap_or("-"))
+            }
         }
     }
 
@@ -2606,6 +2622,23 @@ mod tests {
         Ok(lines.join("\n"))
     }
 
+    fn selected_row_y(app: &mut App, width: u16, height: u16) -> io::Result<Option<u16>> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| render(frame, app))?;
+        let buffer = terminal.backend().buffer();
+
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if buffer[(x, y)].symbol() == "▶" {
+                    return Ok(Some(y));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     fn render_string(app: &mut App) -> io::Result<String> {
         render_string_with_size(app, 120, 40)
     }
@@ -2629,6 +2662,26 @@ mod tests {
 
         app.switch_tab(Tab::Sessions);
         assert_eq!(app.tab_state(Tab::Sessions).selected, sessions_selected);
+    }
+
+    #[test]
+    fn manual_tab_navigation_forces_browse_mode() {
+        let mut app = app();
+        seed(&mut app);
+
+        let calls_top = app
+            .visible_rows(Tab::Calls)
+            .first()
+            .map(|row| row.key.clone());
+        assert_eq!(app.tab_state(Tab::Calls).follow_mode, FollowMode::Follow);
+
+        app.switch_tab(Tab::Calls);
+
+        assert_eq!(app.current_tab, Tab::Calls);
+        assert_eq!(app.tab_state(Tab::Calls).follow_mode, FollowMode::Browse);
+        assert_eq!(app.tab_state(Tab::Calls).selected, calls_top);
+        assert_eq!(app.tab_state(Tab::Calls).scroll_offset, 0);
+        assert_eq!(app.tab_state(Tab::Calls).unseen_count, 0);
     }
 
     #[test]
@@ -2676,15 +2729,52 @@ mod tests {
     }
 
     #[test]
-    fn detail_and_pinned_selection_stay_on_same_entity_after_prepends() {
+    fn session_drilldown_to_calls_enters_browse_mode() {
         let mut app = app();
         seed(&mut app);
 
+        app.switch_tab(Tab::Sessions);
+        app.tab_state_mut(Tab::Sessions).selected =
+            Some(EntityKey::Session("session-a".to_string()));
+
+        let expected_selected = {
+            let scope = DrilldownScope {
+                session_id: Some("session-a".to_string()),
+                call_entity_id: None,
+            };
+            let mut preview = app.tabs.clone();
+            preview[Tab::Calls.index()].scope = scope;
+            let original = std::mem::replace(&mut app.tabs, preview);
+            let selected = app
+                .visible_rows(Tab::Calls)
+                .first()
+                .map(|row| row.key.clone());
+            app.tabs = original;
+            selected
+        };
+
+        app.activate_selected();
+
+        assert_eq!(app.current_tab, Tab::Calls);
+        assert_eq!(app.tab_state(Tab::Calls).follow_mode, FollowMode::Browse);
+        assert_eq!(app.tab_state(Tab::Calls).selected, expected_selected);
+        assert_eq!(app.tab_state(Tab::Calls).scroll_offset, 0);
+        assert_eq!(app.tab_state(Tab::Calls).unseen_count, 0);
+    }
+
+    #[test]
+    fn detail_and_pinned_selection_stay_on_same_entity_after_prepends() {
+        let mut app = app();
+        seed_many_events(&mut app, 12);
+
         app.current_tab = Tab::Events;
-        app.tab_state_mut(Tab::Events).selected = Some(EntityKey::Event("event-3".to_string()));
-        app.current_tab_state_mut().follow_mode = FollowMode::Browse;
+        app.jump_to(8);
+        let before_y = selected_row_y(&mut app, 120, 20)
+            .expect("render selected row")
+            .expect("selected marker");
         app.open_detail();
         let before = app.selected_detail_entity().cloned();
+        let before_scroll = app.tab_state(Tab::Events).scroll_offset;
 
         let new_event = event(
             "session-z",
@@ -2692,13 +2782,42 @@ mod tests {
             "shell",
             Some("call-z"),
             ToolEventKind::ToolCallStart,
-            "2026-03-07T10:00:10Z",
+            "2026-03-07T10:00:59Z",
         );
         let ts = new_event.timestamp.unwrap();
         app.ingest_event(new_event, ts);
+        assert_eq!(app.selected_detail_entity().cloned(), before);
+        app.unwind_route();
+        let after_y = selected_row_y(&mut app, 120, 20)
+            .expect("render selected row after prepend")
+            .expect("selected marker");
 
         assert_eq!(app.tab_state(Tab::Events).selected, before);
-        assert_eq!(app.selected_detail_entity().cloned(), before);
+        assert_eq!(app.tab_state(Tab::Events).scroll_offset, before_scroll + 1);
+        assert_eq!(after_y, before_y);
+    }
+
+    #[test]
+    fn gg_prefix_is_cleared_when_layers_change() {
+        let mut app = app();
+        seed(&mut app);
+        app.current_tab = Tab::Sessions;
+        app.move_selection(1);
+        let selection = app.tab_state(Tab::Sessions).selected.clone();
+
+        assert!(!perform_action(&mut app, Action::GotoTopPrefix));
+        assert!(app.awaiting_gg);
+        assert!(!perform_action(&mut app, Action::OpenDetail));
+        assert!(!app.awaiting_gg);
+        assert_eq!(app.selected_detail_entity().cloned(), selection);
+        assert!(!perform_action(&mut app, Action::Close));
+        assert!(app.detail.is_none());
+
+        assert!(!perform_action(&mut app, Action::GotoTopPrefix));
+        assert!(app.awaiting_gg);
+        assert!(!perform_action(&mut app, Action::ToggleHelp));
+        assert!(!app.awaiting_gg);
+        assert!(app.help_open);
     }
 
     #[test]
@@ -2790,11 +2909,11 @@ mod tests {
             rows_after_move.last().map(|row| row.key.clone())
         );
 
-        assert_eq!(resolve_action(&app, &KeyEvent::from(KeyCode::Char('g'))), Some(Action::GotoTopPrefix));
-        assert!(!perform_action(
-            &mut app,
-            Action::FirstRow
-        ));
+        assert_eq!(
+            resolve_action(&app, &KeyEvent::from(KeyCode::Char('g'))),
+            Some(Action::GotoTopPrefix)
+        );
+        assert!(!perform_action(&mut app, Action::FirstRow));
         assert_eq!(
             app.tab_state(Tab::Sessions).selected,
             rows_after_move.first().map(|row| row.key.clone())
@@ -2814,7 +2933,10 @@ mod tests {
         app.ingest_event(long_event, ts);
 
         app.current_tab = Tab::Events;
-        app.tab_state_mut(Tab::Events).selected = app.visible_rows(Tab::Events).first().map(|row| row.key.clone());
+        app.tab_state_mut(Tab::Events).selected = app
+            .visible_rows(Tab::Events)
+            .first()
+            .map(|row| row.key.clone());
         app.open_detail();
 
         render_string_with_size(&mut app, 40, 10).expect("detail render");
@@ -2903,7 +3025,9 @@ mod tests {
         let pending = render_string(&mut app).expect("pending render");
         assert!(pending.contains("#1234567890 (resolving)"));
         assert_eq!(
-            request_rx.recv_timeout(StdDuration::from_secs(1)).expect("request"),
+            request_rx
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("request"),
             "1234567890"
         );
 
