@@ -1,10 +1,10 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::session_identity::{SessionIdentityConflict, SessionRoutingMetadata};
 
-#[derive(Clone, Debug, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Severity {
     Trace,
     Debug,
@@ -45,7 +45,7 @@ impl Severity {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event_kind", rename_all = "snake_case")]
 pub enum ToolEventKind {
     ToolCallStart,
@@ -115,7 +115,7 @@ impl TimeFilter {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedEvent {
     pub kind: ToolEventKind,
     pub timestamp: Option<DateTime<Utc>>,
@@ -142,7 +142,7 @@ pub struct NormalizedEvent {
     pub is_error: Option<bool>,
     pub call_id: Option<String>,
     pub call_ids: Vec<String>,
-    #[serde(skip)]
+    #[serde(skip, default)]
     pub correlation_ids: Vec<String>,
     pub message_id: Option<String>,
     pub parent_message_id: Option<String>,
