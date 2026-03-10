@@ -216,9 +216,7 @@ impl DiscordLookup for CompositeDiscordLookup {
             .map(str::to_string)
             .ok_or_else(|| {
                 self.unavailable_error.clone().unwrap_or_else(|| {
-                    DiscordLookupError::missing_config(
-                        "discord lookup worker is not configured",
-                    )
+                    DiscordLookupError::missing_config("discord lookup worker is not configured")
                 })
             })
     }
