@@ -2,7 +2,11 @@ use serde_json::Value;
 use std::env;
 
 const DEFAULT_DISCORD_API_BASE: &str = "https://discord.com/api/v10";
-const TOKEN_ENV_VARS: &[&str] = &["LOGPULSE_DISCORD_TOKEN", "DISCORD_TOKEN"];
+const TOKEN_ENV_VARS: &[&str] = &[
+    "LOGPULSE_DISCORD_TOKEN",
+    "DISCORD_TOKEN",
+    "DISCORD_BOT_TOKEN",
+];
 const API_BASE_ENV_VAR: &str = "LOGPULSE_DISCORD_API_BASE";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,7 +178,7 @@ mod tests {
         assert_eq!(
             result,
             Err(DiscordLookupError::missing_token(
-                "set one of LOGPULSE_DISCORD_TOKEN, DISCORD_TOKEN to enable Discord channel resolution"
+                "set one of LOGPULSE_DISCORD_TOKEN, DISCORD_TOKEN, DISCORD_BOT_TOKEN to enable Discord channel resolution"
             ))
         );
     }
@@ -204,5 +208,39 @@ mod tests {
 
         assert_eq!(config.token, "secret-token");
         assert_eq!(config.api_base, "https://discord.example.test/api/v10");
+    }
+
+    #[test]
+    fn config_falls_back_to_discord_bot_token() {
+        let config = DiscordConfig::from_env_with(|key| match key {
+            "DISCORD_BOT_TOKEN" => Some("bot-secret".to_string()),
+            _ => None,
+        })
+        .expect("config");
+
+        assert_eq!(config.token, "bot-secret");
+        assert_eq!(config.api_base, DEFAULT_DISCORD_API_BASE);
+    }
+
+    #[test]
+    fn config_prefers_explicit_token_envs_over_discord_bot_token() {
+        let config = DiscordConfig::from_env_with(|key| match key {
+            "LOGPULSE_DISCORD_TOKEN" => Some("preferred-logpulse-token".to_string()),
+            "DISCORD_TOKEN" => Some("preferred-discord-token".to_string()),
+            "DISCORD_BOT_TOKEN" => Some("fallback-bot-token".to_string()),
+            _ => None,
+        })
+        .expect("config");
+
+        assert_eq!(config.token, "preferred-logpulse-token");
+
+        let config = DiscordConfig::from_env_with(|key| match key {
+            "DISCORD_TOKEN" => Some("preferred-discord-token".to_string()),
+            "DISCORD_BOT_TOKEN" => Some("fallback-bot-token".to_string()),
+            _ => None,
+        })
+        .expect("config");
+
+        assert_eq!(config.token, "preferred-discord-token");
     }
 }
