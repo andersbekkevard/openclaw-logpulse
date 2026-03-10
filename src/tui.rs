@@ -2,8 +2,8 @@ use crate::cli::Args;
 use crate::event::{NormalizedEvent, Severity, TimeFilter, ToolEventKind};
 use crate::normalizer::normalize_many_with_source;
 use crate::projection::{
-    CallStatus, CorrelatedCall, HealthConfig, HealthStatus, MatchConfidence, ProjectionFilter,
-    ProjectionStore, SessionLabelKind, SessionSummary,
+    CallStatus, CorrelatedCall, EventRow, HealthConfig, HealthStatus, MatchConfidence,
+    ProjectionFilter, ProjectionStore, SessionLabelKind, SessionSummary,
 };
 use crate::session_label::{SessionLabelInput, SessionLabelResolver};
 use crate::stale::{HeartbeatSummary, StaleTracker, StaleWarning};
@@ -756,8 +756,7 @@ impl App {
                 ])
             })
             .map(|row| {
-                let display_label = self
-                    .display_session_label(row.session_id.as_deref(), row.session_label.as_deref());
+                let display_label = self.display_event_label(&row);
                 VisibleRow {
                     key: EntityKey::Event(row.event_ref.clone()),
                     searchable: [
@@ -772,8 +771,8 @@ impl App {
                     cells: vec![
                         format_ts(row.timestamp.unwrap_or(self.now)),
                         kind_label(&row.kind).to_string(),
+                        truncate_display(row.agent_id.as_deref().unwrap_or("-"), 10),
                         truncate_display(&display_label, 20),
-                        truncate_display(row.agent_id.as_deref().unwrap_or("-"), 12),
                         truncate_display(row.tool_name.as_deref().unwrap_or("-"), 14),
                         truncate_display(row.status.as_deref().unwrap_or("-"), 14),
                         truncate_display(row.preview.as_deref().unwrap_or("-"), PREVIEW_LEN),
@@ -1460,6 +1459,20 @@ impl App {
         }
     }
 
+    fn display_event_label(&self, row: &EventRow) -> String {
+        self.events_by_ref
+            .get(&row.event_ref)
+            .map(|event| {
+                self.session_labels
+                    .state_for_event(event)
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_else(|| {
+                self.display_session_label(row.session_id.as_deref(), row.session_label.as_deref())
+            })
+    }
+
     fn health_counts(&self) -> (usize, usize, usize) {
         let mut busy = 0;
         let mut stale = 0;
@@ -2018,8 +2031,8 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
         Tab::Events => [
             Constraint::Length(8),
             Constraint::Length(8),
+            Constraint::Length(10),
             Constraint::Length(20),
-            Constraint::Length(12),
             Constraint::Length(14),
             Constraint::Length(14),
             Constraint::Min(20),
@@ -2049,7 +2062,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
 
     let header = match app.current_tab {
         Tab::Events => vec![
-            "time", "kind", "surface", "agent", "tool", "status", "preview",
+            "time", "kind", "agent", "surface", "tool", "status", "preview",
         ],
         Tab::Calls => vec![
             "time", "status", "surface", "agent", "tool", "duration", "preview",
@@ -3137,9 +3150,27 @@ mod tests {
             .map(|row| row.key.clone());
 
         let rendered = render_string(&mut app).expect("rendered");
+        let header = rendered
+            .lines()
+            .find(|line| {
+                line.contains("time") && line.contains("surface") && line.contains("agent")
+            })
+            .expect("events header");
+        let agent_index = header.find("agent").expect("agent column");
+        let surface_index = header.find("surface").expect("surface column");
+        let event_row = app
+            .visible_rows(Tab::Events)
+            .into_iter()
+            .next()
+            .expect("event row");
         let inspector = inspector_string(&app);
-        assert!(rendered.contains("surface"));
-        assert!(rendered.contains("#ops-war-room"));
+        assert!(
+            agent_index < surface_index,
+            "expected agent before surface: {header}"
+        );
+        assert_eq!(event_row.cells[2], "private-channel-13");
+        assert_eq!(event_row.cells[3], "#ops-war-room");
+        assert!(!rendered.contains(&format!("#{channel_id}")));
         assert!(inspector.contains("Surface: #ops-war-room"));
         assert!(inspector.contains(&format!("Session ID: {session_id}")));
         assert!(inspector.contains(&format!("Discord Channel ID: {channel_id}")));
