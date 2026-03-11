@@ -9,7 +9,7 @@ const TOKEN_ENV_VARS: &[&str] = &[
 ];
 const API_BASE_ENV_VAR: &str = "LOGPULSE_DISCORD_API_BASE";
 const FALLBACK_DISCORD_CHANNELS: &[(&str, &str)] = &[
-    ("1477636729950179490", "private-channel-14"),
+    ("1477636729950179490", "private-channel-13"),
     ("1477629839455555698", "private-channel-11"),
     ("1477629901833244865", "private-channel-10"),
     ("1477629926034112653", "private-channel-09"),
@@ -18,6 +18,7 @@ const FALLBACK_DISCORD_CHANNELS: &[(&str, &str)] = &[
     ("1477629989963698278", "private-channel-07"),
     ("1478102405659754526", "private-channel-14"),
     ("1480977465487917097", "private-channel-06"),
+    ("#1481325120319393822", "private-channel-05"),
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
