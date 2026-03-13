@@ -4,6 +4,16 @@ logpulse gives you a fast CLI for live OpenClaw log observation focused on tool-
 
 By default, it now launches a color TUI dashboard for humans. If stdout is not a terminal, it automatically falls back to line-oriented human output so pipes and scripts still behave.
 
+## Screenshots
+
+**Events view** — live tool-call lifecycle with inspector panel:
+
+![Events view](docs/screenshot-events.png)
+
+**Sessions view** — active sessions with contextual help overlay:
+
+![Sessions view](docs/screenshot-sessions.png)
+
 ## Install
 
 ```bash
