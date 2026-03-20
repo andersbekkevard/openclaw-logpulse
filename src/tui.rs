@@ -2444,6 +2444,10 @@ mod tests {
         release_rx: mpsc::Receiver<Result<String, DiscordLookupError>>,
     }
 
+    struct ImmediateDiscordLookup {
+        result: Result<String, DiscordLookupError>,
+    }
+
     impl BlockingDiscordLookup {
         fn new() -> (
             Self,
@@ -2469,6 +2473,12 @@ mod tests {
                 .send(channel_id.to_string())
                 .expect("send lookup request");
             self.release_rx.recv().expect("receive lookup result")
+        }
+    }
+
+    impl DiscordLookup for ImmediateDiscordLookup {
+        fn lookup_channel_name(&self, _channel_id: &str) -> Result<String, DiscordLookupError> {
+            self.result.clone()
         }
     }
 
@@ -3324,7 +3334,16 @@ mod tests {
         let line = r#"{"type":"message","id":"60167cca","parentId":"1f5ac5f2","timestamp":"2026-03-07T09:31:19.656Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_a","name":"read","arguments":{"file_path":"/tmp/a"}}],"stopReason":"toolUse","timestamp":1772875879655}}"#;
         let events = normalize_many_with_source(line, Some(&session_path));
 
-        let mut app = App::new(filters(), 30);
+        let mut app = App::with_session_labels(
+            filters(),
+            30,
+            SessionLabelResolver::with_lookup(
+                chrono::Duration::minutes(5),
+                ImmediateDiscordLookup {
+                    result: Ok("private-channel-13".to_string()),
+                },
+            ),
+        );
         for event in events {
             let ts = event.timestamp.expect("timestamp");
             app.ingest_event(event, ts);

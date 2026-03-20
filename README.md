@@ -122,6 +122,31 @@ Auto-discovery checks these sources, in order:
 - `/var/log/openclaw.log`
 - `/var/log/openclaw/openclaw.log`
 
+## Discord Channel Names
+
+Discord channel-name resolution checks the live Discord API first. Set one of these env vars to enable that lookup:
+
+- `LOGPULSE_DISCORD_TOKEN`
+- `DISCORD_TOKEN`
+- `DISCORD_BOT_TOKEN`
+
+If the live lookup is unavailable or a channel is inaccessible, logpulse can fall back to a local JSON map stored outside the repo at `~/.openclaw/logpulse/discord_channels.json`.
+
+- Override the fallback-file path with `LOGPULSE_DISCORD_CHANNEL_MAP_FILE`.
+- If the fallback file is missing, logpulse behaves as if no local overrides are configured.
+- The fallback file must be a JSON object mapping Discord channel IDs to channel names.
+
+Example shape:
+
+```json
+{
+  "123456789012345678": "main",
+  "234567890123456789": "private-channel-09"
+}
+```
+
+A sanitized example file lives at `docs/examples/discord_channels.json`.
+
 ## Troubleshooting
 
 - If auto-discovery fails, pass a log path directly and confirm permissions: `logpulse <LOG_FILE>`.

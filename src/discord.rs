@@ -1,5 +1,9 @@
 use serde_json::Value;
+use std::collections::HashMap;
 use std::env;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 const TOKEN_ENV_VARS: &[&str] = &[
@@ -8,22 +12,8 @@ const TOKEN_ENV_VARS: &[&str] = &[
     "DISCORD_BOT_TOKEN",
 ];
 const API_BASE_ENV_VAR: &str = "LOGPULSE_DISCORD_API_BASE";
-const FALLBACK_DISCORD_CHANNELS: &[(&str, &str)] = &[
-    ("1477636729950179490", "private-channel-13"),
-    ("1477629839455555698", "private-channel-11"),
-    ("1477629901833244865", "private-channel-10"),
-    ("1477629926034112653", "private-channel-09"),
-    ("1477629953666191360", "private-channel-12"),
-    ("1477629973337739339", "private-channel-08"),
-    ("1477629989963698278", "private-channel-07"),
-    ("1478102405659754526", "private-channel-14"),
-    ("1480977465487917097", "private-channel-06"),
-    ("#1481325120319393822", "private-channel-05"),
-    ("1483483883935895594", "private-channel-01"),
-    ("1484501154141438003", "private-channel-02"),
-    ("1484501153969602662", "private-channel-03"),
-    ("1484501154321797211", "private-channel-04"),
-];
+const CHANNEL_MAP_FILE_ENV_VAR: &str = "LOGPULSE_DISCORD_CHANNEL_MAP_FILE";
+const DEFAULT_CHANNEL_MAP_RELATIVE_PATH: &str = ".openclaw/logpulse/discord_channels.json";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiscordLookupErrorKind {
@@ -91,20 +81,29 @@ pub trait DiscordLookup: Send + 'static {
 
 pub struct CompositeDiscordLookup {
     http: Option<DiscordHttpLookup>,
+    fallback_channels: DiscordChannelFallbacks,
     unavailable_error: Option<DiscordLookupError>,
 }
 
 impl CompositeDiscordLookup {
     pub fn from_env() -> Self {
-        match DiscordConfig::from_env() {
-            Ok(config) => Self {
-                http: Some(DiscordHttpLookup::new(config)),
-                unavailable_error: None,
-            },
-            Err(error) => Self {
-                http: None,
-                unavailable_error: Some(error),
-            },
+        Self::from_env_with(|key| env::var(key).ok())
+    }
+
+    fn from_env_with<F>(mut get: F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let (http, unavailable_error) = match DiscordConfig::from_env_with(&mut get) {
+            Ok(config) => (Some(DiscordHttpLookup::new(config)), None),
+            Err(error) => (None, Some(error)),
+        };
+        let fallback_channels = DiscordChannelFallbacks::from_env_with(get);
+
+        Self {
+            http,
+            fallback_channels,
+            unavailable_error,
         }
     }
 }
@@ -116,10 +115,6 @@ pub struct DiscordConfig {
 }
 
 impl DiscordConfig {
-    pub fn from_env() -> Result<Self, DiscordLookupError> {
-        Self::from_env_with(|key| env::var(key).ok())
-    }
-
     fn from_env_with<F>(mut get: F) -> Result<Self, DiscordLookupError>
     where
         F: FnMut(&str) -> Option<String>,
@@ -210,32 +205,204 @@ impl DiscordLookup for CompositeDiscordLookup {
             match http.lookup_channel_name(channel_id) {
                 Ok(name) => return Ok(name),
                 Err(error) => {
-                    return fallback_channel_name(channel_id)
-                        .map(str::to_string)
-                        .ok_or(error);
+                    if let Some(name) = self.fallback_channels.lookup(channel_id) {
+                        return Ok(name.to_string());
+                    }
+
+                    return Err(self.fallback_channels.load_error().unwrap_or(error));
                 }
             }
         }
 
-        fallback_channel_name(channel_id)
-            .map(str::to_string)
-            .ok_or_else(|| {
-                self.unavailable_error.clone().unwrap_or_else(|| {
-                    DiscordLookupError::missing_config("discord lookup worker is not configured")
-                })
+        if let Some(name) = self.fallback_channels.lookup(channel_id) {
+            return Ok(name.to_string());
+        }
+
+        Err(self.fallback_channels.load_error().unwrap_or_else(|| {
+            self.unavailable_error.clone().unwrap_or_else(|| {
+                DiscordLookupError::missing_config("discord lookup worker is not configured")
             })
+        }))
     }
 }
 
-fn fallback_channel_name(channel_id: &str) -> Option<&'static str> {
-    FALLBACK_DISCORD_CHANNELS
-        .iter()
-        .find_map(|(candidate, name)| (*candidate == channel_id).then_some(*name))
+#[derive(Clone, Debug, Default)]
+struct DiscordChannelFallbacks {
+    names: HashMap<String, String>,
+    load_error: Option<DiscordLookupError>,
+}
+
+impl DiscordChannelFallbacks {
+    fn from_env_with<F>(mut get: F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let path = channel_map_path_from_env(&mut get);
+        Self::from_path(path.as_deref())
+    }
+
+    fn from_path(path: Option<&Path>) -> Self {
+        let Some(path) = path else {
+            return Self::default();
+        };
+
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Self::default(),
+            Err(error) => {
+                return Self {
+                    names: HashMap::new(),
+                    load_error: Some(DiscordLookupError::missing_config(format!(
+                        "failed to read discord channel map file {}: {}",
+                        path.display(),
+                        error
+                    ))),
+                };
+            }
+        };
+
+        let parsed = match serde_json::from_str::<Value>(&contents) {
+            Ok(Value::Object(entries)) => entries,
+            Ok(_) => {
+                return Self {
+                    names: HashMap::new(),
+                    load_error: Some(DiscordLookupError::invalid_response(format!(
+                        "discord channel map file {} must contain a JSON object",
+                        path.display()
+                    ))),
+                };
+            }
+            Err(error) => {
+                return Self {
+                    names: HashMap::new(),
+                    load_error: Some(DiscordLookupError::invalid_response(format!(
+                        "failed to parse discord channel map file {}: {}",
+                        path.display(),
+                        error
+                    ))),
+                };
+            }
+        };
+
+        let mut names = HashMap::new();
+        for (channel_id, value) in parsed {
+            let Some(normalized_id) = normalize_channel_map_key(&channel_id) else {
+                return Self {
+                    names: HashMap::new(),
+                    load_error: Some(DiscordLookupError::invalid_response(format!(
+                        "discord channel map file {} contains an empty channel id key",
+                        path.display()
+                    ))),
+                };
+            };
+
+            let Some(name) = value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return Self {
+                    names: HashMap::new(),
+                    load_error: Some(DiscordLookupError::invalid_response(format!(
+                        "discord channel map file {} contains a non-string or empty name for channel {}",
+                        path.display(),
+                        channel_id
+                    ))),
+                };
+            };
+
+            names.insert(normalized_id.to_string(), name.to_string());
+        }
+
+        Self {
+            names,
+            load_error: None,
+        }
+    }
+
+    fn lookup(&self, channel_id: &str) -> Option<&str> {
+        let normalized = normalize_channel_map_key(channel_id)?;
+        self.names.get(normalized).map(String::as_str)
+    }
+
+    fn load_error(&self) -> Option<DiscordLookupError> {
+        self.load_error.clone()
+    }
+}
+
+fn channel_map_path_from_env<F>(mut get: F) -> Option<PathBuf>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let home = get("HOME")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    get(CHANNEL_MAP_FILE_ENV_VAR)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| expand_home_prefix(&value, home.as_deref()))
+        .or_else(|| home.map(|value| PathBuf::from(value).join(DEFAULT_CHANNEL_MAP_RELATIVE_PATH)))
+}
+
+fn expand_home_prefix(path: &str, home: Option<&str>) -> PathBuf {
+    if path == "~" {
+        return home
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+
+    if let Some(suffix) = path.strip_prefix("~/") {
+        return home
+            .map(|value| PathBuf::from(value).join(suffix))
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+
+    PathBuf::from(path)
+}
+
+fn normalize_channel_map_key(channel_id: &str) -> Option<&str> {
+    let trimmed = channel_id.trim();
+    let normalized = trimmed.strip_prefix('#').unwrap_or(trimmed).trim();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{fs, path::Path};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let unique = format!(
+                "logpulse-{prefix}-{}-{}",
+                process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos()
+            );
+            let path = env::temp_dir().join(unique);
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn config_requires_token() {
@@ -310,9 +477,70 @@ mod tests {
     }
 
     #[test]
-    fn composite_lookup_uses_known_channel_fallback_without_token() {
+    fn missing_channel_map_file_is_non_fatal() {
+        let temp_dir = TempDir::new("missing-channel-map");
+        let map_path = temp_dir.path().join("missing.json");
+        let fallback = DiscordChannelFallbacks::from_env_with(|key| match key {
+            CHANNEL_MAP_FILE_ENV_VAR => Some(map_path.display().to_string()),
+            _ => None,
+        });
+
         let lookup = CompositeDiscordLookup {
             http: None,
+            fallback_channels: fallback,
+            unavailable_error: Some(DiscordLookupError::missing_token("missing token")),
+        };
+
+        assert_eq!(
+            lookup.lookup_channel_name("1234567890"),
+            Err(DiscordLookupError::missing_token("missing token"))
+        );
+    }
+
+    #[test]
+    fn malformed_channel_map_surfaces_invalid_response() {
+        let temp_dir = TempDir::new("malformed-channel-map");
+        let map_path = temp_dir.path().join("discord_channels.json");
+        fs::write(&map_path, "{").expect("write malformed map");
+
+        let lookup = CompositeDiscordLookup {
+            http: None,
+            fallback_channels: DiscordChannelFallbacks::from_env_with(|key| match key {
+                CHANNEL_MAP_FILE_ENV_VAR => Some(map_path.display().to_string()),
+                _ => None,
+            }),
+            unavailable_error: Some(DiscordLookupError::missing_token("missing token")),
+        };
+
+        let error = lookup
+            .lookup_channel_name("1234567890")
+            .expect_err("malformed map should fail");
+        assert_eq!(error.kind, DiscordLookupErrorKind::InvalidResponse);
+        assert!(error
+            .message
+            .contains("failed to parse discord channel map file"));
+        assert!(error.message.contains(&map_path.display().to_string()));
+    }
+
+    #[test]
+    fn composite_lookup_uses_loaded_channel_fallback_without_token() {
+        let temp_dir = TempDir::new("loaded-channel-map");
+        let map_path = temp_dir.path().join("discord_channels.json");
+        fs::write(
+            &map_path,
+            r#"{
+  "1477636729950179490": "main",
+  "1481325120319393822": "private-channel-05"
+}"#,
+        )
+        .expect("write channel map");
+
+        let lookup = CompositeDiscordLookup {
+            http: None,
+            fallback_channels: DiscordChannelFallbacks::from_env_with(|key| match key {
+                CHANNEL_MAP_FILE_ENV_VAR => Some(map_path.display().to_string()),
+                _ => None,
+            }),
             unavailable_error: Some(DiscordLookupError::missing_token("missing token")),
         };
 
@@ -321,33 +549,8 @@ mod tests {
             Ok("main".to_string())
         );
         assert_eq!(
-            lookup.lookup_channel_name("1483483883935895594"),
-            Ok("private-channel-01".to_string())
-        );
-        assert_eq!(
-            lookup.lookup_channel_name("1484501154141438003"),
-            Ok("private-channel-02".to_string())
-        );
-        assert_eq!(
-            lookup.lookup_channel_name("1484501153969602662"),
-            Ok("private-channel-03".to_string())
-        );
-        assert_eq!(
-            lookup.lookup_channel_name("1484501154321797211"),
-            Ok("private-channel-04".to_string())
-        );
-    }
-
-    #[test]
-    fn composite_lookup_preserves_missing_token_for_unknown_channels() {
-        let lookup = CompositeDiscordLookup {
-            http: None,
-            unavailable_error: Some(DiscordLookupError::missing_token("missing token")),
-        };
-
-        assert_eq!(
-            lookup.lookup_channel_name("1234567890"),
-            Err(DiscordLookupError::missing_token("missing token"))
+            lookup.lookup_channel_name("#1481325120319393822"),
+            Ok("private-channel-05".to_string())
         );
     }
 }
