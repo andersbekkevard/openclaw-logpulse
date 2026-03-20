@@ -19,6 +19,10 @@ const FALLBACK_DISCORD_CHANNELS: &[(&str, &str)] = &[
     ("1478102405659754526", "private-channel-14"),
     ("1480977465487917097", "private-channel-06"),
     ("#1481325120319393822", "private-channel-05"),
+    ("1483483883935895594", "private-channel-01"),
+    ("1484501154141438003", "private-channel-02"),
+    ("1484501153969602662", "private-channel-03"),
+    ("1484501154321797211", "private-channel-04"),
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -314,7 +318,23 @@ mod tests {
 
         assert_eq!(
             lookup.lookup_channel_name("1477636729950179490"),
-            Ok("dev".to_string())
+            Ok("main".to_string())
+        );
+        assert_eq!(
+            lookup.lookup_channel_name("1483483883935895594"),
+            Ok("private-channel-01".to_string())
+        );
+        assert_eq!(
+            lookup.lookup_channel_name("1484501154141438003"),
+            Ok("private-channel-02".to_string())
+        );
+        assert_eq!(
+            lookup.lookup_channel_name("1484501153969602662"),
+            Ok("private-channel-03".to_string())
+        );
+        assert_eq!(
+            lookup.lookup_channel_name("1484501154321797211"),
+            Ok("private-channel-04".to_string())
         );
     }
 

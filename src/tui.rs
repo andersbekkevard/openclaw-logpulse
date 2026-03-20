@@ -3350,7 +3350,7 @@ mod tests {
             .next()
             .expect("session row");
         assert_eq!(session_row.cells[1], "private-channel-13");
-        assert_eq!(session_row.cells[2], "#private-channel-14");
+        assert_eq!(session_row.cells[2], "#private-channel-13");
 
         app.current_tab = Tab::Calls;
         let calls_header = render_string(&mut app).expect("calls render");
@@ -3371,7 +3371,7 @@ mod tests {
             .next()
             .expect("call row");
         assert_eq!(call_row.cells[2], "private-channel-13");
-        assert_eq!(call_row.cells[3], "#private-channel-14");
+        assert_eq!(call_row.cells[3], "#private-channel-13");
 
         app.current_tab = Tab::Events;
         let event_row = app
@@ -3380,7 +3380,7 @@ mod tests {
             .next()
             .expect("event row");
         assert_eq!(event_row.cells[2], "private-channel-13");
-        assert_eq!(event_row.cells[3], "#private-channel-14");
+        assert_eq!(event_row.cells[3], "#private-channel-13");
 
         cleanup();
     }
