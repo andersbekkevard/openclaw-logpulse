@@ -529,8 +529,8 @@ mod tests {
         fs::write(
             &map_path,
             r#"{
-  "1477636729950179490": "main",
-  "1481325120319393822": "private-channel-05"
+  "111111111111111111": "alpha-room",
+  "222222222222222222": "beta-room"
 }"#,
         )
         .expect("write channel map");
@@ -545,12 +545,12 @@ mod tests {
         };
 
         assert_eq!(
-            lookup.lookup_channel_name("1477636729950179490"),
-            Ok("main".to_string())
+            lookup.lookup_channel_name("111111111111111111"),
+            Ok("alpha-room".to_string())
         );
         assert_eq!(
-            lookup.lookup_channel_name("#1481325120319393822"),
-            Ok("private-channel-05".to_string())
+            lookup.lookup_channel_name("#222222222222222222"),
+            Ok("beta-room".to_string())
         );
     }
 }

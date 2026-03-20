@@ -2711,7 +2711,7 @@ mod tests {
             .expect("system time")
             .as_nanos();
         let root = std::env::temp_dir().join(format!("logpulse-tui-{unique}"));
-        let sessions_dir = root.join("agents").join("private-channel-13").join("sessions");
+        let sessions_dir = root.join("agents").join("main").join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
         let session_path = sessions_dir.join(format!("{session_id}.jsonl"));
         fs::write(&session_path, "").expect("write session file");
@@ -3299,7 +3299,7 @@ mod tests {
             agent_index < surface_index,
             "expected agent before surface: {header}"
         );
-        assert_eq!(event_row.cells[2], "private-channel-13");
+        assert_eq!(event_row.cells[2], "main");
         assert_eq!(event_row.cells[3], "#ops-war-room");
         assert!(!rendered.contains(&format!("#{channel_id}")));
         assert!(inspector.contains("Surface: #ops-war-room"));
@@ -3340,7 +3340,7 @@ mod tests {
             SessionLabelResolver::with_lookup(
                 chrono::Duration::minutes(5),
                 ImmediateDiscordLookup {
-                    result: Ok("private-channel-13".to_string()),
+                    result: Ok("main".to_string()),
                 },
             ),
         );
@@ -3368,8 +3368,8 @@ mod tests {
             .into_iter()
             .next()
             .expect("session row");
-        assert_eq!(session_row.cells[1], "private-channel-13");
-        assert_eq!(session_row.cells[2], "#private-channel-13");
+        assert_eq!(session_row.cells[1], "main");
+        assert_eq!(session_row.cells[2], "#main");
 
         app.current_tab = Tab::Calls;
         let calls_header = render_string(&mut app).expect("calls render");
@@ -3389,8 +3389,8 @@ mod tests {
             .into_iter()
             .next()
             .expect("call row");
-        assert_eq!(call_row.cells[2], "private-channel-13");
-        assert_eq!(call_row.cells[3], "#private-channel-13");
+        assert_eq!(call_row.cells[2], "main");
+        assert_eq!(call_row.cells[3], "#main");
 
         app.current_tab = Tab::Events;
         let event_row = app
@@ -3398,8 +3398,8 @@ mod tests {
             .into_iter()
             .next()
             .expect("event row");
-        assert_eq!(event_row.cells[2], "private-channel-13");
-        assert_eq!(event_row.cells[3], "#private-channel-13");
+        assert_eq!(event_row.cells[2], "main");
+        assert_eq!(event_row.cells[3], "#main");
 
         cleanup();
     }
