@@ -1,9 +1,11 @@
 use crate::cli::Args;
+use crate::daemon;
 use crate::event::{NormalizedEvent, Severity, TimeFilter, ToolEventKind};
 use crate::history::{PersistedEvent, PersistedHistory, HISTORY_LIMIT};
 use crate::projection::{
-    CallStatus, CorrelatedCall, EventRow, HealthConfig, HealthStatus, MatchConfidence,
-    ProjectionFilter, ProjectionStore, SessionLabelKind, SessionSummary,
+    call_activity_at, CallStatus, CorrelatedCall, EventRow, HealthConfig, HealthStatus,
+    MatchConfidence, ProjectionFilter, ProjectionStore, SessionLabelKind, SessionSummary,
+    SourceState,
 };
 use crate::session_label::{SessionLabelInput, SessionLabelResolver};
 use crate::stale::{HeartbeatSummary, StaleTracker, StaleWarning};
@@ -95,6 +97,45 @@ enum FollowMode {
     Browse,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpsPreset {
+    Live,
+    StaleOnly,
+    Errors,
+    System,
+    Recent15m,
+}
+
+impl OpsPreset {
+    const SELECTABLE: [OpsPreset; 5] = [
+        OpsPreset::Live,
+        OpsPreset::StaleOnly,
+        OpsPreset::Errors,
+        OpsPreset::System,
+        OpsPreset::Recent15m,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            OpsPreset::Live => "Live",
+            OpsPreset::StaleOnly => "Stale",
+            OpsPreset::Errors => "Errors",
+            OpsPreset::System => "System",
+            OpsPreset::Recent15m => "Recent 15m",
+        }
+    }
+
+    fn key(self) -> Option<char> {
+        match self {
+            OpsPreset::Live => Some('1'),
+            OpsPreset::StaleOnly => Some('2'),
+            OpsPreset::Errors => Some('3'),
+            OpsPreset::System => Some('4'),
+            OpsPreset::Recent15m => Some('5'),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct DrilldownScope {
     session_id: Option<String>,
@@ -107,7 +148,6 @@ struct TabStateModel {
     scroll_offset: usize,
     follow_mode: FollowMode,
     unseen_count: usize,
-    search_match_index: usize,
     scope: DrilldownScope,
 }
 
@@ -118,7 +158,6 @@ impl Default for TabStateModel {
             scroll_offset: 0,
             follow_mode: FollowMode::Follow,
             unseen_count: 0,
-            search_match_index: 0,
             scope: DrilldownScope::default(),
         }
     }
@@ -142,10 +181,13 @@ struct WorkspaceFilters {
     agent: Option<String>,
     tool: Option<String>,
     min_level: Severity,
+    base_min_level: Severity,
     time: TimeFilter,
+    base_time: TimeFilter,
     include_system_events: bool,
     stale_only: bool,
     text_search: Option<String>,
+    active_preset: OpsPreset,
     summary: String,
 }
 
@@ -156,10 +198,13 @@ impl WorkspaceFilters {
             agent: args.agent.clone(),
             tool: args.tool.clone(),
             min_level: args.min_severity(),
-            time,
+            base_min_level: args.min_severity(),
+            time: time.clone(),
+            base_time: time,
             include_system_events: false,
             stale_only: false,
             text_search: None,
+            active_preset: OpsPreset::Live,
             summary: format_filters(args),
         }
     }
@@ -220,7 +265,8 @@ enum VisibleRowCells {
     Session {
         session: SessionSummary,
         display_label: String,
-        health: String,
+        call_health: String,
+        source_state: String,
     },
 }
 
@@ -241,6 +287,7 @@ impl VisibleRowItem {
                 truncate_display(row.agent_id.as_deref().unwrap_or("-"), 10),
                 truncate_display(display_label, 20),
                 truncate_display(row.tool_name.as_deref().unwrap_or("-"), 14),
+                truncate_display(&event_call_label(row), 12),
                 truncate_display(row.status.as_deref().unwrap_or("-"), 14),
                 truncate_display(row.preview.as_deref().unwrap_or("-"), PREVIEW_LEN),
             ],
@@ -249,15 +296,13 @@ impl VisibleRowItem {
                 call,
                 display_label,
             } => vec![
-                format_ts(
-                    call.started_at
-                        .or(call.last_updated_at)
-                        .unwrap_or(self.sort_at),
-                ),
+                format_ts(call_activity_at(call).unwrap_or(self.sort_at)),
                 call_status_label(call.status.clone()).to_string(),
+                confidence_label(&call.match_confidence).to_string(),
                 truncate_display(call.agent_id.as_deref().unwrap_or("-"), 12),
                 truncate_display(display_label, 20),
                 truncate_display(call.tool_name.as_deref().unwrap_or("-"), 14),
+                truncate_display(&call_label(call), 12),
                 match call.duration_ms {
                     Some(ms) => format!("{ms}ms"),
                     None => "-".to_string(),
@@ -267,12 +312,14 @@ impl VisibleRowItem {
             VisibleRowCells::Session {
                 session,
                 display_label,
-                health,
+                call_health,
+                source_state,
             } => vec![
                 format_ts(session.last_activity_at.unwrap_or(self.sort_at)),
                 truncate_display(session.agent_id.as_deref().unwrap_or("-"), 12),
                 truncate_display(display_label, 22),
-                health.clone(),
+                call_health.clone(),
+                source_state.clone(),
                 session.open_call_count.to_string(),
                 session.stale_call_count.to_string(),
                 severity_label(session.derived_severity).to_string(),
@@ -286,11 +333,14 @@ enum ActiveLayer {
     Workspace,
     Detail,
     Help,
+    Presets,
+    Search,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     Close,
+    Quit,
     GotoTopPrefix,
     NextRow,
     PreviousRow,
@@ -307,6 +357,10 @@ enum Action {
     Activate,
     OpenDetail,
     ToggleHelp,
+    TogglePresets,
+    OpenSearch,
+    ToggleStaleOnly,
+    ApplyPreset(OpsPreset),
 }
 
 #[derive(Clone, Copy)]
@@ -319,6 +373,7 @@ enum KeyMatcher {
     End,
     Esc,
     Enter,
+    Backspace,
 }
 
 impl KeyMatcher {
@@ -334,6 +389,7 @@ impl KeyMatcher {
             KeyMatcher::End => key.code == KeyCode::End,
             KeyMatcher::Esc => key.code == KeyCode::Esc,
             KeyMatcher::Enter => key.code == KeyCode::Enter,
+            KeyMatcher::Backspace => key.code == KeyCode::Backspace,
         }
     }
 
@@ -351,6 +407,7 @@ impl KeyMatcher {
             KeyMatcher::End => "End",
             KeyMatcher::Esc => "Esc",
             KeyMatcher::Enter => "Enter",
+            KeyMatcher::Backspace => "Backspace",
         }
     }
 }
@@ -367,25 +424,29 @@ struct KeyBinding {
 const WORKSPACE_ONLY: &[ActiveLayer] = &[ActiveLayer::Workspace];
 const HELP_ONLY: &[ActiveLayer] = &[ActiveLayer::Help];
 const WORKSPACE_AND_DETAIL: &[ActiveLayer] = &[ActiveLayer::Workspace, ActiveLayer::Detail];
+const PRESETS_ONLY: &[ActiveLayer] = &[ActiveLayer::Presets];
+const SEARCH_ONLY: &[ActiveLayer] = &[ActiveLayer::Search];
 const ALL_TABS: &[Tab] = &[Tab::Sessions, Tab::Calls, Tab::Events];
 const EVENTS_ONLY: &[Tab] = &[Tab::Events];
 
 const KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         matcher: KeyMatcher::Char('q'),
-        action: Action::Close,
-        description: "Close overlay/detail or quit",
+        action: Action::Quit,
+        description: "Quit",
         layers: &[
             ActiveLayer::Workspace,
             ActiveLayer::Detail,
             ActiveLayer::Help,
+            ActiveLayer::Presets,
+            ActiveLayer::Search,
         ],
         tabs: ALL_TABS,
     },
     KeyBinding {
         matcher: KeyMatcher::Esc,
         action: Action::Close,
-        description: "Close overlay/detail or unwind route",
+        description: "Back",
         layers: &[
             ActiveLayer::Workspace,
             ActiveLayer::Detail,
@@ -398,6 +459,27 @@ const KEY_BINDINGS: &[KeyBinding] = &[
         action: Action::ToggleHelp,
         description: "Toggle contextual help",
         layers: WORKSPACE_AND_DETAIL,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Char('p'),
+        action: Action::TogglePresets,
+        description: "Open presets",
+        layers: WORKSPACE_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Char('/'),
+        action: Action::OpenSearch,
+        description: "Search visible rows",
+        layers: WORKSPACE_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Char('s'),
+        action: Action::ToggleStaleOnly,
+        description: "Toggle stale-only",
+        layers: WORKSPACE_ONLY,
         tabs: ALL_TABS,
     },
     KeyBinding {
@@ -554,6 +636,76 @@ const KEY_BINDINGS: &[KeyBinding] = &[
         layers: HELP_ONLY,
         tabs: ALL_TABS,
     },
+    KeyBinding {
+        matcher: KeyMatcher::Esc,
+        action: Action::Close,
+        description: "Close presets",
+        layers: PRESETS_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Char('p'),
+        action: Action::Close,
+        description: "Close presets",
+        layers: PRESETS_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Char('1'),
+        action: Action::ApplyPreset(OpsPreset::Live),
+        description: "Preset: Live",
+        layers: PRESETS_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Char('2'),
+        action: Action::ApplyPreset(OpsPreset::StaleOnly),
+        description: "Preset: Stale only",
+        layers: PRESETS_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Char('3'),
+        action: Action::ApplyPreset(OpsPreset::Errors),
+        description: "Preset: Errors",
+        layers: PRESETS_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Char('4'),
+        action: Action::ApplyPreset(OpsPreset::System),
+        description: "Preset: System",
+        layers: PRESETS_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Char('5'),
+        action: Action::ApplyPreset(OpsPreset::Recent15m),
+        description: "Preset: Recent 15m",
+        layers: PRESETS_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Esc,
+        action: Action::Close,
+        description: "Cancel search",
+        layers: SEARCH_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Enter,
+        action: Action::Close,
+        description: "Apply search",
+        layers: SEARCH_ONLY,
+        tabs: ALL_TABS,
+    },
+    KeyBinding {
+        matcher: KeyMatcher::Backspace,
+        action: Action::Close,
+        description: "Erase search character",
+        layers: SEARCH_ONLY,
+        tabs: ALL_TABS,
+    },
 ];
 
 struct App {
@@ -567,6 +719,9 @@ struct App {
     route_stack: Vec<RouteSnapshot>,
     detail: Option<DetailState>,
     help_open: bool,
+    presets_open: bool,
+    search_open: bool,
+    search_draft: String,
     help_scroll: usize,
     awaiting_gg: bool,
     filters: WorkspaceFilters,
@@ -610,6 +765,9 @@ impl App {
             route_stack: Vec::new(),
             detail: None,
             help_open: false,
+            presets_open: false,
+            search_open: false,
+            search_draft: String::new(),
             help_scroll: 0,
             awaiting_gg: false,
             filters,
@@ -629,6 +787,10 @@ impl App {
     fn layer(&self) -> ActiveLayer {
         if self.help_open {
             ActiveLayer::Help
+        } else if self.presets_open {
+            ActiveLayer::Presets
+        } else if self.search_open {
+            ActiveLayer::Search
         } else if self.detail.is_some() {
             ActiveLayer::Detail
         } else {
@@ -654,6 +816,71 @@ impl App {
 
     fn projection_filter(&self) -> ProjectionFilter {
         self.filters.projection_filter()
+    }
+
+    fn apply_filter_change(&mut self, update: impl FnOnce(&mut WorkspaceFilters, DateTime<Utc>)) {
+        let before = self.snapshot_visible_keys();
+        update(&mut self.filters, self.now);
+        self.reconcile_after_data_change(before);
+    }
+
+    fn apply_preset(&mut self, preset: OpsPreset) {
+        self.apply_filter_change(|filters, now| {
+            filters.min_level = filters.base_min_level;
+            filters.time = filters.base_time.clone();
+            filters.include_system_events = false;
+            filters.stale_only = false;
+            filters.active_preset = preset;
+
+            match preset {
+                OpsPreset::Live => {}
+                OpsPreset::StaleOnly => {
+                    filters.stale_only = true;
+                }
+                OpsPreset::Errors => {
+                    filters.min_level = Severity::Error;
+                    filters.include_system_events = true;
+                }
+                OpsPreset::System => {
+                    filters.include_system_events = true;
+                }
+                OpsPreset::Recent15m => {
+                    filters.time.since = Some(now - chrono::Duration::minutes(15));
+                    filters.time.until = None;
+                }
+            }
+        });
+    }
+
+    fn toggle_stale_only(&mut self) {
+        self.apply_filter_change(|filters, _now| {
+            filters.stale_only = !filters.stale_only;
+            filters.active_preset = if filters.stale_only {
+                OpsPreset::StaleOnly
+            } else {
+                OpsPreset::Live
+            };
+        });
+    }
+
+    fn open_search(&mut self) {
+        self.search_draft = self.filters.text_search.clone().unwrap_or_default();
+        self.search_open = true;
+        self.presets_open = false;
+        self.help_open = false;
+    }
+
+    fn apply_search(&mut self) {
+        let query = self.search_draft.trim().to_string();
+        self.search_open = false;
+        self.apply_filter_change(|filters, _now| {
+            filters.text_search = (!query.is_empty()).then_some(query);
+        });
+    }
+
+    fn cancel_search(&mut self) {
+        self.search_open = false;
+        self.search_draft.clear();
     }
 
     fn ingest_event(&mut self, event: NormalizedEvent, observed_at: DateTime<Utc>) {
@@ -839,10 +1066,12 @@ impl App {
                         return false;
                     }
                 }
+                let call_label = event_call_label(row);
                 self.matches_text_search(&[
                     display_label.as_str(),
                     row.agent_id.as_deref().unwrap_or_default(),
                     row.tool_name.as_deref().unwrap_or_default(),
+                    call_label.as_str(),
                     row.status.as_deref().unwrap_or_default(),
                     row.preview.as_deref().unwrap_or_default(),
                 ])
@@ -856,6 +1085,7 @@ impl App {
                         display_label.clone(),
                         row.agent_id.clone().unwrap_or_default(),
                         row.tool_name.clone().unwrap_or_default(),
+                        event_call_label(&row),
                         row.status.clone().unwrap_or_default(),
                         row.preview.clone().unwrap_or_default(),
                     ]
@@ -914,9 +1144,10 @@ impl App {
                         cells: VisibleRowCells::Notice(vec![
                             format_ts(notice.seen_at),
                             "STALE".to_string(),
-                            truncate_display(warning.session_key.as_deref().unwrap_or("-"), 20),
                             "-".to_string(),
+                            truncate_display(warning.session_key.as_deref().unwrap_or("-"), 20),
                             truncate_display(warning.tool_name.as_deref().unwrap_or("-"), 14),
+                            truncate_display(&warning.call_id, 12),
                             format!("{}s", warning.age_seconds),
                             truncate_display(
                                 warning.message.as_deref().unwrap_or("Long-running call"),
@@ -942,6 +1173,7 @@ impl App {
                             "-".to_string(),
                             "-".to_string(),
                             "heartbeat".to_string(),
+                            "-".to_string(),
                             format!("a={} s={}", summary.active_calls, summary.stale_calls),
                             truncate_display(&summary.to_line(), PREVIEW_LEN),
                         ]),
@@ -963,6 +1195,7 @@ impl App {
                             "system".to_string(),
                             "-".to_string(),
                             "error".to_string(),
+                            "-".to_string(),
                             "error".to_string(),
                             truncate_display(message, PREVIEW_LEN),
                         ]),
@@ -998,6 +1231,8 @@ impl App {
                     &display_label,
                     call.agent_id.as_deref().unwrap_or_default(),
                     call.tool_name.as_deref().unwrap_or_default(),
+                    call.canonical_call_id.as_deref().unwrap_or_default(),
+                    confidence_label(&call.match_confidence),
                     call.message_preview.as_deref().unwrap_or_default(),
                 ])
             })
@@ -1006,13 +1241,15 @@ impl App {
                     Some(call.session_id.as_str()),
                     Some(call.session_label.as_str()),
                 );
-                let sort_at = call.started_at.or(call.last_updated_at).unwrap_or(self.now);
+                let sort_at = call_activity_at(&call).unwrap_or(self.now);
                 VisibleRowItem {
                     key: EntityKey::Call(call.call_entity_id.clone()),
                     searchable: [
                         display_label.clone(),
                         call.agent_id.clone().unwrap_or_default(),
                         call.tool_name.clone().unwrap_or_default(),
+                        call_label(&call),
+                        confidence_label(&call.match_confidence).to_string(),
                         call.message_preview.clone().unwrap_or_default(),
                     ]
                     .join(" "),
@@ -1048,7 +1285,8 @@ impl App {
                 ])
             })
             .map(|session| {
-                let health = health_status_label(session.health_status.clone()).to_string();
+                let call_health = call_health_label(&session).to_string();
+                let source_state = source_state_label(&session.source_state).to_string();
                 let display_label = self.display_session_label(
                     Some(session.session_id.as_str()),
                     Some(session.session_label.as_str()),
@@ -1059,14 +1297,16 @@ impl App {
                     searchable: [
                         display_label.clone(),
                         session.agent_id.clone().unwrap_or_default(),
-                        health.clone(),
+                        call_health.clone(),
+                        source_state.clone(),
                     ]
                     .join(" "),
                     sort_at,
                     cells: VisibleRowCells::Session {
                         session,
                         display_label,
-                        health,
+                        call_health,
+                        source_state,
                     },
                 }
             })
@@ -1138,7 +1378,6 @@ impl App {
         if self.current_tab_state().follow_mode == FollowMode::Follow {
             let rows = self.visible_rows(tab);
             let target = self.tab_state_mut(tab);
-            target.follow_mode = FollowMode::Browse;
             target.unseen_count = 0;
             target.scroll_offset = 0;
             target.selected = rows.first().map(|row| row.key.clone());
@@ -1480,7 +1719,9 @@ impl App {
                     .map(|value| value.to_rfc3339())
                     .unwrap_or_else(|| "-".to_string()),
             ),
-            kv_line("Health", health_status_label(session.health_status)),
+            kv_line("Call health", call_health_label(&session)),
+            kv_line("Source state", source_state_label(&session.source_state)),
+            kv_line("Overall health", health_status_label(session.health_status)),
             kv_line("Open calls", &session.open_call_count.to_string()),
             kv_line("Stale calls", &session.stale_call_count.to_string()),
             kv_line("Severity", severity_label(session.derived_severity)),
@@ -1571,6 +1812,40 @@ impl App {
         (busy, stale, disconnected)
     }
 
+    fn active_filter_summary(&self) -> String {
+        let mut parts = vec![format!("preset={}", self.filters.active_preset.label())];
+        if self.filters.stale_only {
+            parts.push("stale-only".to_string());
+        }
+        if self.filters.include_system_events {
+            parts.push("system-events".to_string());
+        }
+        if let Some(query) = self.filters.text_search.as_ref() {
+            parts.push(format!("search={query}"));
+        }
+        parts.push(format!(
+            "min-level={}",
+            severity_label(self.filters.min_level)
+        ));
+        if self.filters.time.since != self.filters.base_time.since {
+            if let Some(since) = self.filters.time.since {
+                parts.push(format!(
+                    "since={}",
+                    since.with_timezone(&Local).format("%H:%M:%S")
+                ));
+            }
+        }
+        if self.filters.time.until != self.filters.base_time.until {
+            if let Some(until) = self.filters.time.until {
+                parts.push(format!(
+                    "until={}",
+                    until.with_timezone(&Local).format("%H:%M:%S")
+                ));
+            }
+        }
+        parts.join("  ")
+    }
+
     fn help_lines(&self) -> Text<'static> {
         let underlying = if self.detail.is_some() {
             ActiveLayer::Detail
@@ -1588,9 +1863,10 @@ impl App {
                     FollowMode::Browse => "BROWSE",
                 },
             ),
+            kv_line("Preset", self.filters.active_preset.label()),
             kv_line(
-                "Search match",
-                &self.current_tab_state().search_match_index.to_string(),
+                "Search",
+                self.filters.text_search.as_deref().unwrap_or("(none)"),
             ),
         ];
         lines.push(section_header("Bindings"));
@@ -1665,10 +1941,11 @@ impl App {
     }
 }
 
-pub fn run(args: &Args) -> io::Result<()> {
+pub fn run(args: &Args, auto_discover: bool) -> io::Result<()> {
     let time_filter = args
         .time_filter()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    daemon::ensure_background_daemon(args, auto_discover)?;
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -1753,6 +2030,10 @@ fn handle_input(app: &mut App, timeout: Duration) -> io::Result<bool> {
             return Ok(false);
         }
 
+        if app.search_open {
+            return Ok(handle_search_input(app, &key));
+        }
+
         if app.awaiting_gg {
             app.awaiting_gg = false;
             if key.code == KeyCode::Char('g') {
@@ -1776,11 +2057,38 @@ fn handle_input(app: &mut App, timeout: Duration) -> io::Result<bool> {
     Ok(false)
 }
 
+fn handle_search_input(app: &mut App, key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            app.cancel_search();
+            false
+        }
+        KeyCode::Enter => {
+            app.apply_search();
+            false
+        }
+        KeyCode::Backspace => {
+            app.search_draft.pop();
+            false
+        }
+        KeyCode::Char(value) => {
+            app.search_draft.push(value);
+            false
+        }
+        _ => false,
+    }
+}
+
 fn perform_action(app: &mut App, action: Action) -> bool {
     match action {
         Action::Close => {
             app.awaiting_gg = false;
-            app.unwind_route()
+            app.unwind_route();
+            false
+        }
+        Action::Quit => {
+            app.awaiting_gg = false;
+            true
         }
         Action::GotoTopPrefix => {
             app.awaiting_gg = true;
@@ -1886,7 +2194,34 @@ fn perform_action(app: &mut App, action: Action) -> bool {
             app.help_open = !app.help_open;
             if app.help_open {
                 app.help_scroll = 0;
+                app.presets_open = false;
+                app.search_open = false;
             }
+            false
+        }
+        Action::TogglePresets => {
+            app.awaiting_gg = false;
+            app.presets_open = !app.presets_open;
+            if app.presets_open {
+                app.help_open = false;
+                app.search_open = false;
+            }
+            false
+        }
+        Action::OpenSearch => {
+            app.awaiting_gg = false;
+            app.open_search();
+            false
+        }
+        Action::ToggleStaleOnly => {
+            app.awaiting_gg = false;
+            app.toggle_stale_only();
+            false
+        }
+        Action::ApplyPreset(preset) => {
+            app.awaiting_gg = false;
+            app.apply_preset(preset);
+            app.presets_open = false;
             false
         }
     }
@@ -1973,6 +2308,10 @@ fn render(frame: &mut Frame, app: &mut App) {
         render_detail(frame, frame.area(), app);
         if app.help_open {
             render_help(frame, app);
+        } else if app.presets_open {
+            render_presets(frame, app);
+        } else if app.search_open {
+            render_search(frame, app);
         }
         return;
     }
@@ -1980,7 +2319,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(7),
             Constraint::Min(10),
             Constraint::Length(2),
         ])
@@ -1992,6 +2331,10 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     if app.help_open {
         render_help(frame, app);
+    } else if app.presets_open {
+        render_presets(frame, app);
+    } else if app.search_open {
+        render_search(frame, app);
     }
 }
 
@@ -2025,6 +2368,24 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect::<Vec<_>>();
 
+    let preset_line = OpsPreset::SELECTABLE
+        .into_iter()
+        .map(|preset| {
+            let style = if preset == app.filters.active_preset {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Span::styled(
+                format!(" {} {} ", preset.key().unwrap_or('?'), preset.label()),
+                style,
+            )
+        })
+        .collect::<Vec<_>>();
+
     let text = Text::from(vec![
         Line::from(vec![
             Span::styled(
@@ -2037,11 +2398,15 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(app.breadcrumb(), Style::default().fg(Color::White)),
         ]),
         Line::from(tab_line),
+        Line::from(preset_line),
         Line::from(vec![
-            Span::styled("health ", Style::default().fg(Color::DarkGray)),
+            Span::styled("status ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!(
-                "busy {}  stale {}  disconnected {}",
-                busy, stale, disconnected
+                "busy {}  stale {}  disconnected {}  {}",
+                busy,
+                stale,
+                disconnected,
+                app.active_filter_summary()
             )),
         ]),
         Line::from(vec![
@@ -2081,45 +2446,49 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
     let widths = match app.current_tab {
         Tab::Events => [
             Constraint::Length(8),
+            Constraint::Length(7),
             Constraint::Length(8),
+            Constraint::Length(16),
             Constraint::Length(10),
-            Constraint::Length(20),
-            Constraint::Length(14),
-            Constraint::Length(14),
-            Constraint::Min(20),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Min(12),
         ]
         .to_vec(),
         Tab::Calls => [
             Constraint::Length(8),
-            Constraint::Length(11),
+            Constraint::Length(9),
+            Constraint::Length(5),
+            Constraint::Length(8),
             Constraint::Length(12),
-            Constraint::Length(20),
-            Constraint::Length(14),
-            Constraint::Length(10),
-            Constraint::Min(20),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Min(10),
         ]
         .to_vec(),
         Tab::Sessions => [
             Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Length(22),
-            Constraint::Length(14),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(16),
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(7),
         ]
         .to_vec(),
     };
 
     let header = match app.current_tab {
         Tab::Events => vec![
-            "time", "kind", "agent", "surface", "tool", "status", "preview",
+            "time", "kind", "agent", "surface", "tool", "call", "status", "preview",
         ],
         Tab::Calls => vec![
-            "time", "status", "agent", "surface", "tool", "duration", "preview",
+            "time", "status", "conf", "agent", "surface", "tool", "call", "dur", "preview",
         ],
         Tab::Sessions => vec![
-            "time", "agent", "surface", "health", "open", "stale", "level",
+            "time", "agent", "surface", "calls", "source", "open", "stale", "level",
         ],
     };
 
@@ -2185,29 +2554,76 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let layer = app.layer();
-    let bindings = if layer == ActiveLayer::Help {
-        active_bindings(ActiveLayer::Help, app.current_tab)
-    } else {
-        active_bindings(layer, app.current_tab)
-    };
-    let spans = bindings
-        .iter()
-        .take(6)
-        .flat_map(|binding| {
+    let spans = footer_items(app)
+        .into_iter()
+        .flat_map(|(key, label)| {
             vec![
                 Span::styled(
-                    binding.matcher.label().to_string(),
+                    key,
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!(" {}  ", binding.description)),
+                Span::raw(format!(" {label}  ")),
             ]
         })
         .collect::<Vec<_>>();
     let paragraph = Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL));
     frame.render_widget(paragraph, area);
+}
+
+fn footer_items(app: &App) -> Vec<(String, String)> {
+    match app.layer() {
+        ActiveLayer::Help => vec![
+            ("?".to_string(), "close help".to_string()),
+            ("Esc".to_string(), "back".to_string()),
+            ("j/k".to_string(), "scroll".to_string()),
+            ("q".to_string(), "quit".to_string()),
+        ],
+        ActiveLayer::Presets => OpsPreset::SELECTABLE
+            .into_iter()
+            .filter_map(|preset| {
+                preset
+                    .key()
+                    .map(|key| (key.to_string(), preset.label().to_string()))
+            })
+            .chain([
+                ("Esc".to_string(), "back".to_string()),
+                ("q".to_string(), "quit".to_string()),
+            ])
+            .collect(),
+        ActiveLayer::Search => vec![
+            ("/".to_string(), format!("search {}", app.search_draft)),
+            ("Enter".to_string(), "apply".to_string()),
+            ("Esc".to_string(), "cancel".to_string()),
+            ("Backspace".to_string(), "erase".to_string()),
+        ],
+        ActiveLayer::Detail => vec![
+            ("Esc".to_string(), "back".to_string()),
+            ("j/k".to_string(), "scroll".to_string()),
+            ("gg".to_string(), "top".to_string()),
+            ("G".to_string(), "bottom".to_string()),
+            ("?".to_string(), "help".to_string()),
+            ("q".to_string(), "quit".to_string()),
+        ],
+        ActiveLayer::Workspace => {
+            let enter = match app.current_tab {
+                Tab::Sessions => "calls",
+                Tab::Calls => "events",
+                Tab::Events => "detail",
+            };
+            vec![
+                ("Enter".to_string(), enter.to_string()),
+                ("Esc".to_string(), "back".to_string()),
+                ("p".to_string(), "presets".to_string()),
+                ("/".to_string(), "search".to_string()),
+                ("s".to_string(), "stale".to_string()),
+                ("f".to_string(), "follow".to_string()),
+                ("?".to_string(), "help".to_string()),
+                ("q".to_string(), "quit".to_string()),
+            ]
+        }
+    }
 }
 
 fn render_help(frame: &mut Frame, app: &mut App) {
@@ -2224,6 +2640,67 @@ fn render_help(frame: &mut Frame, app: &mut App) {
         )
         .wrap(Wrap { trim: false })
         .scroll((help_scroll, 0));
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_presets(frame: &mut Frame, app: &App) {
+    let popup = centered_rect(54, 36, frame.area());
+    frame.render_widget(Clear, popup);
+    let mut lines = vec![title_line("Presets", Color::Cyan), Line::from("")];
+    for preset in OpsPreset::SELECTABLE {
+        let selected = preset == app.filters.active_preset;
+        let marker = if selected { ">" } else { " " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(format!("{marker} ")),
+            Span::styled(
+                format!("{} ", preset.key().unwrap_or('?')),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(preset.label(), style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("Esc ", Style::default().fg(Color::Yellow)),
+        Span::raw("back"),
+    ]));
+
+    let paragraph = Paragraph::new(Text::from(lines)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Preset Operations"),
+    );
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_search(frame: &mut Frame, app: &App) {
+    let popup = centered_rect(60, 18, frame.area());
+    frame.render_widget(Clear, popup);
+    let query = if app.search_draft.is_empty() {
+        "(empty clears search)".to_string()
+    } else {
+        app.search_draft.clone()
+    };
+    let text = Text::from(vec![
+        title_line("Search", Color::Cyan),
+        Line::from(vec![
+            Span::styled("/ ", Style::default().fg(Color::Yellow)),
+            Span::raw(query),
+        ]),
+        Line::from(""),
+        Line::from("Enter applies  Esc cancels  Backspace erases"),
+    ]);
+    let paragraph =
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Search Rows"));
     frame.render_widget(paragraph, popup);
 }
 
@@ -2281,6 +2758,56 @@ fn kind_label(kind: &ToolEventKind) -> &'static str {
         ToolEventKind::ToolCall => "CALL",
         ToolEventKind::Other => "OTHER",
         ToolEventKind::Malformed => "BAD",
+    }
+}
+
+fn event_call_label(row: &EventRow) -> String {
+    row.call_ids
+        .first()
+        .map(|call_id| compact_id(call_id, 12))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn call_label(call: &CorrelatedCall) -> String {
+    call.canonical_call_id
+        .as_deref()
+        .map(|call_id| compact_id(call_id, 12))
+        .unwrap_or_else(|| compact_id(&call.call_entity_id, 12))
+}
+
+fn compact_id(value: &str, max_chars: usize) -> String {
+    let short = value
+        .rsplit([':', '|'])
+        .next()
+        .filter(|part| !part.is_empty())
+        .unwrap_or(value);
+    truncate_display(short, max_chars)
+}
+
+fn confidence_label(confidence: &MatchConfidence) -> &'static str {
+    match confidence {
+        MatchConfidence::ExplicitId => "id",
+        MatchConfidence::TranscriptBundle => "bundle",
+        MatchConfidence::FallbackSignature => "guess",
+    }
+}
+
+fn call_health_label(session: &SessionSummary) -> &'static str {
+    if session.stale_call_count > 0 {
+        "stale"
+    } else if session.open_call_count > 0 {
+        "busy"
+    } else {
+        "idle"
+    }
+}
+
+fn source_state_label(state: &SourceState) -> &'static str {
+    match state {
+        SourceState::Live => "live",
+        SourceState::Quiet => "quiet",
+        SourceState::Missing => "missing",
+        SourceState::Unknown => "unknown",
     }
 }
 
@@ -2585,10 +3112,13 @@ mod tests {
             agent: None,
             tool: None,
             min_level: Severity::Trace,
+            base_min_level: Severity::Trace,
             time: TimeFilter::default(),
+            base_time: TimeFilter::default(),
             include_system_events: false,
             stale_only: false,
             text_search: None,
+            active_preset: OpsPreset::Live,
             summary: "test".to_string(),
         }
     }
@@ -2676,6 +3206,63 @@ mod tests {
             let ts = event.timestamp.unwrap();
             app.ingest_event(event, ts);
         }
+    }
+
+    #[test]
+    fn calls_tab_follow_tracks_latest_call_activity() {
+        let mut app = app();
+        app.current_tab = Tab::Calls;
+
+        for item in [
+            event(
+                "session-a",
+                Some("label-a"),
+                "shell",
+                Some("call-a"),
+                ToolEventKind::ToolCallStart,
+                "2026-03-07T10:00:00Z",
+            ),
+            event(
+                "session-a",
+                Some("label-a"),
+                "read",
+                Some("call-b"),
+                ToolEventKind::ToolCallStart,
+                "2026-03-07T10:01:00Z",
+            ),
+        ] {
+            let ts = item.timestamp.unwrap();
+            app.ingest_event(item, ts);
+        }
+
+        assert_eq!(
+            app.visible_rows(Tab::Calls)
+                .first()
+                .map(|row| row.key.clone()),
+            Some(EntityKey::Call("session-a:call-b".to_string()))
+        );
+
+        let result = event(
+            "session-a",
+            Some("label-a"),
+            "shell",
+            Some("call-a"),
+            ToolEventKind::ToolCallResult,
+            "2026-03-07T10:02:00Z",
+        );
+        let ts = result.timestamp.unwrap();
+        app.ingest_event(result, ts);
+
+        assert_eq!(
+            app.visible_rows(Tab::Calls)
+                .first()
+                .map(|row| row.key.clone()),
+            Some(EntityKey::Call("session-a:call-a".to_string()))
+        );
+        assert_eq!(
+            app.tab_state(Tab::Calls).selected,
+            Some(EntityKey::Call("session-a:call-a".to_string()))
+        );
     }
 
     fn render_string_with_size(app: &mut App, width: u16, height: u16) -> io::Result<String> {
@@ -2857,7 +3444,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_tab_navigation_forces_browse_mode() {
+    fn manual_tab_navigation_preserves_follow_mode() {
         let mut app = app();
         seed(&mut app);
 
@@ -2870,10 +3457,125 @@ mod tests {
         app.switch_tab(Tab::Calls);
 
         assert_eq!(app.current_tab, Tab::Calls);
-        assert_eq!(app.tab_state(Tab::Calls).follow_mode, FollowMode::Browse);
+        assert_eq!(app.tab_state(Tab::Calls).follow_mode, FollowMode::Follow);
         assert_eq!(app.tab_state(Tab::Calls).selected, calls_top);
         assert_eq!(app.tab_state(Tab::Calls).scroll_offset, 0);
         assert_eq!(app.tab_state(Tab::Calls).unseen_count, 0);
+    }
+
+    #[test]
+    fn stale_toggle_and_presets_drive_visible_filters() {
+        let mut app = app();
+        seed(&mut app);
+        app.current_tab = Tab::Events;
+
+        assert!(app
+            .visible_rows(Tab::Events)
+            .iter()
+            .any(|row| matches!(row.key, EntityKey::Event(_))));
+
+        assert!(!perform_action(&mut app, Action::ToggleStaleOnly));
+        assert!(app.filters.stale_only);
+        assert_eq!(app.filters.active_preset, OpsPreset::StaleOnly);
+        assert!(app
+            .visible_rows(Tab::Events)
+            .iter()
+            .all(|row| matches!(row.key, EntityKey::Notice(_))));
+
+        assert!(!perform_action(
+            &mut app,
+            Action::ApplyPreset(OpsPreset::Errors)
+        ));
+        assert_eq!(app.filters.active_preset, OpsPreset::Errors);
+        assert_eq!(app.filters.min_level, Severity::Error);
+        assert!(app.filters.include_system_events);
+        assert!(!app.filters.stale_only);
+    }
+
+    #[test]
+    fn search_input_filters_rows_and_can_be_cleared() {
+        let mut app = app();
+        let read = event(
+            "session-c",
+            Some("label-c"),
+            "read",
+            Some("call-read"),
+            ToolEventKind::ToolCallStart,
+            "2026-03-07T10:00:05Z",
+        );
+        let ts = read.timestamp.unwrap();
+        app.ingest_event(read, ts);
+        seed(&mut app);
+        app.current_tab = Tab::Events;
+
+        app.open_search();
+        for ch in "read".chars() {
+            assert!(!handle_search_input(
+                &mut app,
+                &KeyEvent::from(KeyCode::Char(ch))
+            ));
+        }
+        assert!(!handle_search_input(
+            &mut app,
+            &KeyEvent::from(KeyCode::Enter)
+        ));
+
+        assert_eq!(app.filters.text_search.as_deref(), Some("read"));
+        let rows = app.visible_rows(Tab::Events);
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row.searchable.contains("read")));
+
+        app.open_search();
+        for _ in 0..4 {
+            assert!(!handle_search_input(
+                &mut app,
+                &KeyEvent::from(KeyCode::Backspace)
+            ));
+        }
+        assert!(!handle_search_input(
+            &mut app,
+            &KeyEvent::from(KeyCode::Enter)
+        ));
+        assert!(app.filters.text_search.is_none());
+    }
+
+    #[test]
+    fn esc_backs_out_without_quitting_at_root() {
+        let mut app = app();
+        seed(&mut app);
+
+        assert!(!perform_action(&mut app, Action::Close));
+        assert_eq!(app.current_tab, Tab::Sessions);
+        assert!(perform_action(&mut app, Action::Quit));
+    }
+
+    #[test]
+    fn ops_columns_expose_call_identity_confidence_and_split_session_health() {
+        let mut app = app();
+        seed(&mut app);
+
+        let event_row = app
+            .visible_rows(Tab::Events)
+            .into_iter()
+            .find(|row| matches!(row.key, EntityKey::Event(_)))
+            .expect("event row");
+        assert_eq!(event_row.cells[5], "call-1");
+
+        let call_row = app
+            .visible_rows(Tab::Calls)
+            .into_iter()
+            .next()
+            .expect("call row");
+        assert_eq!(call_row.cells[2], "id");
+        assert_eq!(call_row.cells[6], "call-1");
+
+        let session_row = app
+            .visible_rows(Tab::Sessions)
+            .into_iter()
+            .next()
+            .expect("session row");
+        assert!(["idle", "busy", "stale"].contains(&session_row.cells[3].as_str()));
+        assert!(["live", "quiet", "missing", "unknown"].contains(&session_row.cells[4].as_str()));
     }
 
     #[test]
@@ -3382,25 +4084,13 @@ mod tests {
         assert_eq!(session_row.cells[2], "#main");
 
         app.current_tab = Tab::Calls;
-        let calls_header = render_string(&mut app).expect("calls render");
-        let calls_header = calls_header
-            .lines()
-            .find(|line| {
-                line.contains("time") && line.contains("status") && line.contains("surface")
-            })
-            .expect("calls header");
-        assert!(
-            calls_header.find("agent").expect("agent")
-                < calls_header.find("surface").expect("surface"),
-            "expected agent before surface: {calls_header}"
-        );
         let call_row = app
             .visible_rows(Tab::Calls)
             .into_iter()
             .next()
             .expect("call row");
-        assert_eq!(call_row.cells[2], "main");
-        assert_eq!(call_row.cells[3], "#main");
+        assert_eq!(call_row.cells[3], "main");
+        assert_eq!(call_row.cells[4], "#main");
 
         app.current_tab = Tab::Events;
         let event_row = app

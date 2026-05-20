@@ -25,8 +25,10 @@ pub fn discover_session_logs(root: &Path) -> io::Result<Vec<PathBuf>> {
             continue;
         }
 
-        let candidate_dir = agent_entry.path().join("sessions");
+        let agent_path = agent_entry.path();
+        let candidate_dir = agent_path.join("sessions");
         if !candidate_dir.is_dir() {
+            collect_nested_codex_session_logs(&agent_path, &mut paths);
             continue;
         }
 
@@ -46,10 +48,47 @@ pub fn discover_session_logs(root: &Path) -> io::Result<Vec<PathBuf>> {
 
             paths.push(file_path);
         }
+
+        collect_nested_codex_session_logs(&agent_path, &mut paths);
     }
 
     paths.sort_by_key(|path| session_file_sort_key(path.as_path()));
     Ok(paths)
+}
+
+fn collect_nested_codex_session_logs(agent_path: &Path, paths: &mut Vec<PathBuf>) {
+    let nested_agents_dir = agent_path.join("agent");
+    let Ok(nested_agents) = fs::read_dir(nested_agents_dir) else {
+        return;
+    };
+
+    for nested_agent in nested_agents.flatten() {
+        let Ok(file_type) = nested_agent.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        collect_rollout_logs(&nested_agent.path().join("sessions"), paths);
+    }
+}
+
+fn collect_rollout_logs(root: &Path, paths: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_rollout_logs(&path, paths);
+        } else if is_codex_rollout_log_file(&path) {
+            paths.push(path);
+        }
+    }
 }
 
 fn is_session_log_file(path: &Path) -> bool {
@@ -79,6 +118,13 @@ fn is_session_log_file(path: &Path) -> bool {
     }
 
     is_uuid(base)
+}
+
+fn is_codex_rollout_log_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    file_name.starts_with("rollout-") && file_name.ends_with(".jsonl")
 }
 
 fn is_uuid(value: &str) -> bool {
@@ -132,4 +178,54 @@ fn session_file_sort_key(path: &Path) -> (String, u8, String) {
     };
 
     (root, file_type, file_name.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("logpulse-discovery-{unique}"))
+    }
+
+    #[test]
+    fn discovers_openclaw_sessions_and_nested_codex_rollouts() {
+        let root = temp_root();
+        let openclaw_sessions = root.join("agents").join("main").join("sessions");
+        let codex_sessions = root
+            .join("agents")
+            .join("main")
+            .join("agent")
+            .join("codex-home")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("20");
+        fs::create_dir_all(&openclaw_sessions).expect("openclaw sessions dir");
+        fs::create_dir_all(&codex_sessions).expect("codex sessions dir");
+
+        let openclaw_log = openclaw_sessions.join("12345678-1234-1234-1234-123456789abc.jsonl");
+        let trajectory =
+            openclaw_sessions.join("12345678-1234-1234-1234-123456789abc.trajectory.jsonl");
+        let rollout_log = codex_sessions.join("rollout-2026-05-20T17-06-34-019e465a.jsonl");
+        let unrelated = codex_sessions.join("notes.jsonl");
+        fs::write(&openclaw_log, "").expect("write openclaw log");
+        fs::write(&trajectory, "").expect("write trajectory");
+        fs::write(&rollout_log, "").expect("write rollout log");
+        fs::write(&unrelated, "").expect("write unrelated");
+
+        let discovered = discover_session_logs(&root).expect("discover logs");
+
+        assert!(discovered.contains(&openclaw_log));
+        assert!(discovered.contains(&rollout_log));
+        assert!(!discovered.contains(&trajectory));
+        assert!(!discovered.contains(&unrelated));
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 }

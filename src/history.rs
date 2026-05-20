@@ -358,15 +358,16 @@ fn trim_history(tx: &Transaction<'_>, limit: usize) -> io::Result<()> {
     Ok(())
 }
 
-fn default_history_path() -> io::Result<PathBuf> {
+pub(crate) fn default_history_dir() -> io::Result<PathBuf> {
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-    Ok(home
-        .join(".openclaw")
-        .join("logpulse")
-        .join("history.sqlite3"))
+    Ok(home.join(".openclaw").join("logpulse"))
+}
+
+fn default_history_path() -> io::Result<PathBuf> {
+    Ok(default_history_dir()?.join("history.sqlite3"))
 }
 
 fn parse_timestamp(value: &str) -> io::Result<DateTime<Utc>> {

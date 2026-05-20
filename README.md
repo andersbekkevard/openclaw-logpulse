@@ -96,25 +96,37 @@ logpulse tui clear
 - `--no-follow` read existing content only.
 - `--fresh` skip restoring persisted TUI history for this run. `logpulse tui --fresh` is the explicit TUI form.
 - `daemon` collect discovered OpenClaw session logs into `~/.openclaw/logpulse/history.sqlite3`.
+  The TUI auto-starts this collector when following so new rows keep arriving even though rendering is database-backed.
 - `tui clear` delete the persisted TUI history store at `~/.openclaw/logpulse/history.sqlite3`.
 
 ### TUI controls
 
 - `q` quit
-- `↑/↓` or `j/k` move through events
-- `f` toggle auto-follow of the newest event
-- `PgUp/PgDn` scroll the detail pane
-- `g` jump to newest event, `G` jump to oldest retained event
+- `Esc` go back through detail, scoped drilldowns, and overlays
+- `1`/`2`/`3` jump to Sessions, Tool Calls, and Events
+- `h`/`l` move between tabs
+- `↑/↓` or `j/k` move through the current table; manual movement enters BROWSE
+- `Enter` drill in from Sessions → Tool Calls → Events, then open detail
+- `o` open fullscreen detail from Events
+- `f` resume FOLLOW for the active tab
+- `gg` jump to newest row, `G` jump to oldest retained row
+- `PgUp`/`PgDn` scroll fullscreen detail and help
+- `p` open preset operations; `1` Live, `2` Stale, `3` Errors, `4` System, `5` Recent 15m
+- `/` search visible rows; `Enter` applies, `Esc` cancels, empty search clears
+- `s` toggle stale-only mode
+- `?` toggle contextual help
 
-The timeline is intentionally compact while the detail pane shows the decoded event metadata plus a pretty-printed raw payload, so you can read things like exec commands, memory queries, and tool results without staring at compressed JSON soup.
+The dashboard is organized as an ops cockpit: Sessions show call health and source state separately, Tool Calls show correlation confidence plus compact call IDs, and Events keep call IDs visible beside tool/status previews. The inspector still shows decoded event metadata plus a pretty-printed raw payload when you need the full record.
 
-The TUI restores up to the newest 10,000 normalized events from a global SQLite history store and polls that store for updates. It does not own log collection; run `logpulse daemon` in the background to keep events current even while the TUI is closed. Use `logpulse tui clear` to wipe that store; in-TUI clearing remains viewport-only and does not delete persisted history.
+The TUI restores up to the newest 10,000 normalized events from a global SQLite history store and polls that store for updates. When following discovered sources, it starts the collector daemon automatically so new events keep arriving even while rendering stays database-backed. Use `logpulse tui clear` to wipe that store; in-TUI filtering and presets remain viewport-only and do not delete persisted history.
 
-Auto-discovery scans `~/.openclaw/agents/*/sessions` for OpenClaw transcript files:
+Auto-discovery scans `~/.openclaw/agents/*/sessions` and nested
+`~/.openclaw/agents/*/agent/*/sessions/**` trees for OpenClaw and Codex transcript files:
 
 - active `<session-id>.jsonl` files
 - reset archives named `<session-id>.jsonl.reset.<timestamp>`
 - deleted archives named `<session-id>.jsonl.deleted.<timestamp>`
+- Codex `rollout-*.jsonl` files
 
 It ignores `sessions.json`, lock files, trajectory sidecars, and unrelated JSONL.
 

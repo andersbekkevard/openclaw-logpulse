@@ -1,15 +1,21 @@
 use crate::cli::Args;
 use crate::discovery;
-use crate::history::{PersistedHistory, SourceCheckpointUpdate, SourceEventPosition};
+use crate::history::{
+    default_history_dir, PersistedHistory, SourceCheckpointUpdate, SourceEventPosition,
+};
 use crate::normalizer::normalize_many_with_source;
 use crate::tailer::{source_file_identity, SourceFileIdentity, TailedLine, Tailer};
 use chrono::Utc;
 use std::collections::HashSet;
 use std::env;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::PathBuf;
+use std::process::{self, Command, Stdio};
 use std::time::{Duration, Instant};
 
+const DAEMON_PID_FILE: &str = "daemon.pid";
+const DAEMON_LOG_FILE: &str = "daemon.log";
 const MISSING_TTL_SECONDS: u64 = 30;
 const COMPACT_FREE_PAGE_THRESHOLD: usize = 1024;
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(600);
@@ -22,6 +28,10 @@ struct SourceReader {
 }
 
 pub fn run(args: &Args, auto_discover: bool) -> io::Result<()> {
+    let _pid_guard = match DaemonPidGuard::acquire()? {
+        Some(guard) => guard,
+        None => return Ok(()),
+    };
     let mut collector = Collector::new(args)?;
     let mut last_scan = Instant::now();
 
@@ -47,6 +57,160 @@ pub fn run(args: &Args, auto_discover: bool) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+pub fn ensure_background_daemon(args: &Args, auto_discover: bool) -> io::Result<()> {
+    if args.no_follow {
+        return Ok(());
+    }
+
+    let pid_path = daemon_pid_path()?;
+    if let Some(pid) = read_daemon_pid(&pid_path)? {
+        if daemon_pid_is_running(pid) {
+            return Ok(());
+        }
+        let _ = fs::remove_file(&pid_path);
+    }
+
+    if let Some(pid) = find_running_daemon_pid() {
+        write_daemon_pid(&pid_path, pid)?;
+        return Ok(());
+    }
+
+    let log_path = default_history_dir()?.join(DAEMON_LOG_FILE);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let stderr = log.try_clone()?;
+    let mut command = Command::new(env::current_exe()?);
+    command.arg("daemon");
+    if !auto_discover {
+        if let Some(path) = args.log_file.as_ref() {
+            command.arg(path);
+        }
+    }
+    command
+        .arg("--poll-millis")
+        .arg(args.poll_millis.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+
+    let child = command.spawn()?;
+    write_daemon_pid(&pid_path, child.id())?;
+    Ok(())
+}
+
+struct DaemonPidGuard {
+    path: PathBuf,
+    pid: u32,
+}
+
+impl DaemonPidGuard {
+    fn acquire() -> io::Result<Option<Self>> {
+        let path = daemon_pid_path()?;
+        let current_pid = process::id();
+
+        if let Some(pid) = read_daemon_pid(&path)? {
+            if pid != current_pid && daemon_pid_is_running(pid) {
+                return Ok(None);
+            }
+            let _ = fs::remove_file(&path);
+        }
+
+        if let Some(pid) = find_running_daemon_pid() {
+            write_daemon_pid(&path, pid)?;
+            return Ok(None);
+        }
+
+        write_daemon_pid(&path, current_pid)?;
+        Ok(Some(Self {
+            path,
+            pid: current_pid,
+        }))
+    }
+}
+
+impl Drop for DaemonPidGuard {
+    fn drop(&mut self) {
+        let Ok(Some(pid)) = read_daemon_pid(&self.path) else {
+            return;
+        };
+        if pid == self.pid {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn daemon_pid_path() -> io::Result<PathBuf> {
+    Ok(default_history_dir()?.join(DAEMON_PID_FILE))
+}
+
+fn read_daemon_pid(path: &PathBuf) -> io::Result<Option<u32>> {
+    match fs::read_to_string(path) {
+        Ok(value) => Ok(value.trim().parse::<u32>().ok()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn write_daemon_pid(path: &PathBuf, pid: u32) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{pid}\n"))
+}
+
+fn find_running_daemon_pid() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let current_pid = process::id();
+        let entries = fs::read_dir("/proc").ok()?;
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(pid_text) = file_name.to_str() else {
+                continue;
+            };
+            let Ok(pid) = pid_text.parse::<u32>() else {
+                continue;
+            };
+            if pid != current_pid && daemon_pid_is_running(pid) {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+fn daemon_pid_is_running(pid: u32) -> bool {
+    if pid == process::id() {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let cmdline_path = PathBuf::from("/proc").join(pid.to_string()).join("cmdline");
+        let Ok(cmdline) = fs::read(cmdline_path) else {
+            return false;
+        };
+        let args = cmdline
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>();
+        return args.iter().any(|arg| arg.contains("logpulse"))
+            && args.iter().any(|arg| arg == "daemon");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 struct Collector {

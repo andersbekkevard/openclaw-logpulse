@@ -329,9 +329,8 @@ impl AppModel {
             .collect::<Vec<_>>();
 
         calls.sort_by(|a, b| {
-            b.started_at
-                .or(b.last_updated_at)
-                .cmp(&a.started_at.or(a.last_updated_at))
+            call_activity_at(b)
+                .cmp(&call_activity_at(a))
                 .then_with(|| a.call_entity_id.cmp(&b.call_entity_id))
         });
         disambiguate_tool_calls(&mut calls);
@@ -1095,6 +1094,10 @@ fn compact_session_label(value: &str, head: usize, tail: usize) -> String {
 pub type CorrelatedCall = ToolCallSummary;
 pub type ProjectionStore = AppModel;
 
+pub fn call_activity_at(call: &ToolCallSummary) -> Option<DateTime<Utc>> {
+    call.last_updated_at.or(call.started_at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1257,6 +1260,63 @@ mod tests {
         assert!(calls
             .iter()
             .all(|call| call.match_confidence == MatchConfidence::FallbackSignature));
+    }
+
+    #[test]
+    fn correlated_calls_sort_by_latest_activity() {
+        let mut store = ProjectionStore::default();
+        let now = DateTime::parse_from_rfc3339("2026-03-07T10:03:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        for item in [
+            event(
+                "session-1",
+                Some("label-a"),
+                "shell",
+                Some("call-a"),
+                ToolEventKind::ToolCallStart,
+                "2026-03-07T10:00:00Z",
+            ),
+            event(
+                "session-1",
+                Some("label-a"),
+                "read",
+                Some("call-b"),
+                ToolEventKind::ToolCallStart,
+                "2026-03-07T10:01:00Z",
+            ),
+            event(
+                "session-1",
+                Some("label-a"),
+                "shell",
+                Some("call-a"),
+                ToolEventKind::ToolCallResult,
+                "2026-03-07T10:02:00Z",
+            ),
+        ] {
+            store.ingest_event(item, now);
+        }
+
+        let filter = ProjectionFilter {
+            min_level: Severity::Trace,
+            ..ProjectionFilter::default()
+        };
+        let calls = store.correlated_calls(&filter, now, &HealthConfig::default());
+        let call_ids = calls
+            .iter()
+            .map(|call| call.canonical_call_id.as_deref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(call_ids, vec![Some("call-a"), Some("call-b")]);
+        assert_eq!(
+            call_activity_at(&calls[0]),
+            Some(
+                DateTime::parse_from_rfc3339("2026-03-07T10:02:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
     }
 
     #[test]

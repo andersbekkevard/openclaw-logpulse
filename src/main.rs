@@ -74,7 +74,7 @@ fn main() {
     };
 
     if args.format == OutputMode::Tui {
-        if let Err(err) = tui::run(&args) {
+        if let Err(err) = tui::run(&args, auto_discover) {
             eprintln!("failed to start TUI: {}", err);
         }
         return;
