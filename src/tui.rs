@@ -2382,11 +2382,44 @@ fn rebuild_history_view(
     last_history_id: &mut i64,
     stale_after_seconds: u64,
 ) -> io::Result<()> {
+    let before = app.snapshot_visible_keys();
+    let current_tab = app.current_tab;
+    let tabs = app.tabs.clone();
+    let route_stack = app.route_stack.clone();
+    let detail = app.detail.clone();
+    let help_open = app.help_open;
+    let presets_open = app.presets_open;
+    let search_open = app.search_open;
+    let search_draft = app.search_draft.clone();
+    let help_scroll = app.help_scroll;
+    let awaiting_gg = app.awaiting_gg;
+    let detail_view_width = app.detail_view_width;
+    let detail_view_height = app.detail_view_height;
+    let help_view_width = app.help_view_width;
+    let help_view_height = app.help_view_height;
+
     let filters = app.filters.clone();
     let mut rebuilt = App::new(filters, stale_after_seconds);
     let mut rebuilt_tracker = StaleTracker::new(stale_after_seconds);
     restore_history(&mut rebuilt, &mut rebuilt_tracker, history, false)?;
     *last_history_id = history.max_id()?;
+
+    rebuilt.current_tab = current_tab;
+    rebuilt.tabs = tabs;
+    rebuilt.route_stack = route_stack;
+    rebuilt.detail = detail;
+    rebuilt.help_open = help_open;
+    rebuilt.presets_open = presets_open;
+    rebuilt.search_open = search_open;
+    rebuilt.search_draft = search_draft;
+    rebuilt.help_scroll = help_scroll;
+    rebuilt.awaiting_gg = awaiting_gg;
+    rebuilt.detail_view_width = detail_view_width;
+    rebuilt.detail_view_height = detail_view_height;
+    rebuilt.help_view_width = help_view_width;
+    rebuilt.help_view_height = help_view_height;
+    rebuilt.reconcile_after_data_change(before);
+
     *app = rebuilt;
     *tracker = rebuilt_tracker;
     Ok(())
@@ -3828,6 +3861,83 @@ mod tests {
         assert_eq!(app.tab_state(Tab::Calls).selected, expected_selected);
         assert_eq!(app.tab_state(Tab::Calls).scroll_offset, 0);
         assert_eq!(app.tab_state(Tab::Calls).unseen_count, 0);
+    }
+
+    #[test]
+    fn history_rebuild_preserves_interaction_state() {
+        let path = history_path();
+        let mut history = PersistedHistory::open(&path).expect("open history");
+        let events = vec![
+            event(
+                "session-a",
+                Some("label-shared"),
+                "shell",
+                Some("call-1"),
+                ToolEventKind::ToolCallStart,
+                "2026-03-07T10:00:00Z",
+            ),
+            event(
+                "session-b",
+                Some("label-shared"),
+                "shell",
+                Some("call-1"),
+                ToolEventKind::ToolCallStart,
+                "2026-03-07T10:00:01Z",
+            ),
+            event(
+                "session-a",
+                Some("label-shared"),
+                "shell",
+                Some("call-1"),
+                ToolEventKind::ToolCallResult,
+                "2026-03-07T10:00:02Z",
+            ),
+            event(
+                "session-b",
+                Some("label-shared"),
+                "shell",
+                Some("call-1"),
+                ToolEventKind::ToolCallResult,
+                "2026-03-07T10:00:03Z",
+            ),
+        ];
+        let mut app = app();
+        for item in events {
+            let ts = item.timestamp.unwrap();
+            history.append(ts, &item).expect("append history");
+            app.ingest_event(item, ts);
+        }
+
+        app.switch_tab(Tab::Sessions);
+        app.tab_state_mut(Tab::Sessions).selected =
+            Some(EntityKey::Session("session-a".to_string()));
+        app.activate_selected();
+        assert_eq!(app.current_tab, Tab::Calls);
+        app.activate_selected();
+        assert_eq!(app.current_tab, Tab::Events);
+        app.open_detail();
+        let detail_entity = app.selected_detail_entity().cloned();
+        let route_depth = app.route_stack.len();
+
+        let mut tracker = StaleTracker::new(30);
+        let mut last_history_id = 0;
+        rebuild_history_view(&mut app, &mut tracker, &history, &mut last_history_id, 30)
+            .expect("rebuild history view");
+
+        assert_eq!(app.current_tab, Tab::Events);
+        assert!(app.detail.is_some());
+        assert_eq!(app.selected_detail_entity().cloned(), detail_entity);
+        assert_eq!(app.route_stack.len(), route_depth);
+        assert_eq!(
+            app.tab_state(Tab::Events).scope.session_id.as_deref(),
+            Some("session-a")
+        );
+        assert_eq!(
+            app.tab_state(Tab::Events).scope.call_entity_id.as_deref(),
+            Some("session-a:call-1")
+        );
+
+        fs::remove_dir_all(path.parent().expect("parent")).expect("cleanup");
     }
 
     #[test]
