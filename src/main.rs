@@ -1,4 +1,5 @@
 mod cli;
+mod daemon;
 mod discord;
 mod discovery;
 mod event;
@@ -35,25 +36,33 @@ fn main() {
         Err(err) => err.exit(),
     };
 
-    if let CliCommand::TuiClear = command {
-        match clear_default_history() {
-            Ok(path) => {
-                println!("cleared persisted TUI history at {}", path.display());
+    let (mut args, auto_discover) = match command {
+        CliCommand::TuiClear => {
+            match clear_default_history() {
+                Ok(path) => {
+                    println!("cleared persisted TUI history at {}", path.display());
+                }
+                Err(err) => {
+                    eprintln!("failed to clear persisted TUI history: {err}");
+                    std::process::exit(1);
+                }
             }
-            Err(err) => {
-                eprintln!("failed to clear persisted TUI history: {err}");
+            return;
+        }
+        CliCommand::Daemon {
+            args,
+            auto_discover,
+        } => {
+            if let Err(err) = daemon::run(&args, auto_discover) {
+                eprintln!("logpulse daemon failed: {err}");
                 std::process::exit(1);
             }
+            return;
         }
-        return;
-    }
-
-    let CliCommand::Run {
-        mut args,
-        auto_discover,
-    } = command
-    else {
-        unreachable!("handled all CLI commands");
+        CliCommand::Run {
+            args,
+            auto_discover,
+        } => (args, auto_discover),
     };
     args.format = effective_mode(args.format);
     let time_filter = match args.time_filter() {
@@ -206,7 +215,8 @@ fn process_raw_line(
 ) {
     let now = Utc::now();
     for event in normalize_many_with_source(raw_line, source_path) {
-        let notices = tracker.on_event(&event, now);
+        let event_time = event.timestamp.unwrap_or(now);
+        let notices = tracker.on_event(&event, event_time);
 
         if event.should_filter(
             args.session.as_ref(),
@@ -221,7 +231,7 @@ fn process_raw_line(
         }
 
         for warning in notices {
-            if !time_filter.contains(Some(now)) {
+            if !time_filter.contains(Some(event_time)) {
                 continue;
             }
             if let Err(err) = output::emit_stale_warning(&warning, args.format, stdout) {

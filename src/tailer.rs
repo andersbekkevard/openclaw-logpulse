@@ -4,6 +4,20 @@ use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Debug)]
+pub struct SourceFileIdentity {
+    pub key: String,
+    pub inode: u64,
+    pub device: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct TailedLine {
+    pub offset: u64,
+    pub next_offset: u64,
+    pub line: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 enum SourceIdentity {
     #[cfg(unix)]
@@ -56,6 +70,10 @@ impl Tailer {
     }
 
     pub fn next_line(&mut self) -> io::Result<Option<String>> {
+        Ok(self.next_line_with_offset()?.map(|line| line.line))
+    }
+
+    pub fn next_line_with_offset(&mut self) -> io::Result<Option<TailedLine>> {
         if self.reader.is_none() {
             if !self.follow {
                 return Ok(None);
@@ -71,10 +89,15 @@ impl Tailer {
 
         let reader = self.reader.as_mut().expect("reader initialized");
         let mut line = String::new();
+        let offset = self.position;
         let bytes = reader.read_line(&mut line)?;
         if bytes > 0 {
             self.position += bytes as u64;
-            return Ok(Some(line));
+            return Ok(Some(TailedLine {
+                offset,
+                next_offset: self.position,
+                line,
+            }));
         }
 
         self.handle_eof_or_rotation()?;
@@ -127,6 +150,38 @@ impl Tailer {
         Ok(())
     }
 
+    pub fn new_at(
+        path: PathBuf,
+        follow: bool,
+        start_position: u64,
+        poll_interval: Duration,
+    ) -> io::Result<Self> {
+        let mut state = Self {
+            path,
+            reader: None,
+            position: 0,
+            inode: 0,
+            device: 0,
+            follow,
+            poll_interval,
+        };
+        state.reopen_at(start_position)?;
+        Ok(state)
+    }
+
+    fn reopen_at(&mut self, start_position: u64) -> io::Result<()> {
+        let mut file = File::open(&self.path)?;
+        let metadata = file.metadata()?;
+        let (inode, device, size) = file_id_and_size(&metadata);
+        let start = start_position.min(size);
+        file.seek(SeekFrom::Start(start))?;
+        self.reader = Some(BufReader::new(file));
+        self.position = start;
+        self.inode = inode;
+        self.device = device;
+        Ok(())
+    }
+
     fn reader_meta(&self) -> Option<Metadata> {
         self.reader
             .as_ref()
@@ -138,9 +193,10 @@ impl Tailer {
             Ok(meta) => {
                 let mut file = File::open(&self.path)?;
                 let (_inode, _device, size) = file_id_and_size(&meta);
-                file.seek(SeekFrom::End(0))?;
+                let start = self.position.min(size);
+                file.seek(SeekFrom::Start(start))?;
                 self.reader = Some(BufReader::new(file));
-                self.position = size;
+                self.position = start;
                 let (inode, device, _) = file_id_and_size(&meta);
                 self.inode = inode;
                 self.device = device;
@@ -161,6 +217,17 @@ impl Tailer {
     pub(crate) fn set_path(&mut self, path: PathBuf) {
         self.path = path;
     }
+}
+
+pub fn source_file_identity(path: &Path) -> io::Result<SourceFileIdentity> {
+    let meta = fs::metadata(path)?;
+    let (inode, device, _) = file_id_and_size(&meta);
+    let key = if inode == 0 && device == 0 {
+        format!("path:{}", path.display())
+    } else {
+        format!("dev:{device}:ino:{inode}")
+    };
+    Ok(SourceFileIdentity { key, inode, device })
 }
 
 pub struct MultiTailer {

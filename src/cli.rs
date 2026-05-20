@@ -35,7 +35,7 @@ impl LevelArg {
     name = "logpulse",
     version,
     about = "Live visibility for OpenClaw tool calls",
-    after_help = "Special TUI commands:\n  logpulse tui --fresh    Launch the TUI without restoring persisted history\n  logpulse tui clear      Delete the persisted TUI history store"
+    after_help = "Special commands:\n  logpulse daemon         Collect OpenClaw session events into the SQLite store\n  logpulse tui --fresh    Launch the TUI without restoring persisted history\n  logpulse tui clear      Delete the persisted TUI history store"
 )]
 pub struct Args {
     #[arg(value_name = "LOG_FILE")]
@@ -84,6 +84,7 @@ pub struct Args {
 #[derive(Debug)]
 pub(crate) enum CliCommand {
     Run { args: Args, auto_discover: bool },
+    Daemon { args: Args, auto_discover: bool },
     TuiClear,
 }
 
@@ -133,6 +134,19 @@ where
         rewritten.extend(tail[1..].iter().cloned());
         let args = Args::try_parse_from(rewritten)?;
         return Ok(CliCommand::Run {
+            auto_discover: args.log_file.is_none(),
+            args,
+        });
+    }
+
+    if matches!(
+        tail.first().and_then(|value| value.to_str()),
+        Some("daemon")
+    ) {
+        let mut rewritten = vec![program];
+        rewritten.extend(tail[1..].iter().cloned());
+        let args = Args::try_parse_from(rewritten)?;
+        return Ok(CliCommand::Daemon {
             auto_discover: args.log_file.is_none(),
             args,
         });
@@ -198,6 +212,21 @@ mod tests {
                 auto_discover,
             } => {
                 assert!(args.fresh);
+                assert!(auto_discover);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_daemon_command() {
+        let command = parse_command_from(["logpulse", "daemon"]).expect("parse command");
+        match command {
+            CliCommand::Daemon {
+                args,
+                auto_discover,
+            } => {
+                assert!(args.log_file.is_none());
                 assert!(auto_discover);
             }
             other => panic!("unexpected command: {other:?}"),

@@ -263,6 +263,10 @@ impl AppModel {
         event_ref
     }
 
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
     pub fn project_events(&self, filter: &ProjectionFilter) -> Vec<EventRow> {
         self.event_rows(filter)
     }

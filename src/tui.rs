@@ -1,14 +1,12 @@
 use crate::cli::Args;
 use crate::event::{NormalizedEvent, Severity, TimeFilter, ToolEventKind};
-use crate::history::PersistedHistory;
-use crate::normalizer::normalize_many_with_source;
+use crate::history::{PersistedEvent, PersistedHistory, HISTORY_LIMIT};
 use crate::projection::{
     CallStatus, CorrelatedCall, EventRow, HealthConfig, HealthStatus, MatchConfidence,
     ProjectionFilter, ProjectionStore, SessionLabelKind, SessionSummary,
 };
 use crate::session_label::{SessionLabelInput, SessionLabelResolver};
 use crate::stale::{HeartbeatSummary, StaleTracker, StaleWarning};
-use crate::{discovery, tailer};
 use chrono::{DateTime, Local, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
@@ -23,14 +21,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState,
 use ratatui::{Frame, Terminal};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::hash::{Hash, Hasher};
 use std::io::{self, stdout};
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const DRAIN_PER_TICK: usize = 128;
-const MISSING_TTL_SECONDS: u64 = 30;
 const PREVIEW_LEN: usize = 72;
 const SESSION_LABEL_CACHE_TTL_MINUTES: i64 = 15;
 const SCROLL_OFF: usize = 5;
@@ -184,6 +179,7 @@ impl WorkspaceFilters {
 enum NoticeKind {
     Stale(StaleWarning),
     Heartbeat(HeartbeatSummary),
+    #[allow(dead_code)]
     Error(String),
 }
 
@@ -588,6 +584,10 @@ impl App {
         self.reconcile_after_data_change(before);
     }
 
+    fn event_count(&self) -> usize {
+        self.store.event_count()
+    }
+
     fn refresh_session_labels(&mut self, now: DateTime<Utc>) -> bool {
         self.session_labels.refresh(now)
     }
@@ -607,6 +607,7 @@ impl App {
         self.reconcile_after_data_change(before);
     }
 
+    #[allow(dead_code)]
     fn ingest_error(&mut self, message: impl Into<String>, observed_at: DateTime<Utc>) {
         let before = self.snapshot_visible_keys();
         self.push_notice(NoticeKind::Error(message.into()), observed_at);
@@ -1614,74 +1615,12 @@ fn run_app(
     let filters = WorkspaceFilters::from_args(args, time_filter.clone());
     let mut app = App::new(filters, args.stale_seconds);
     let mut tracker = StaleTracker::new(args.stale_seconds);
-    let mut history = PersistedHistory::open_default()?;
+    let history = PersistedHistory::open_default()?;
     restore_history(&mut app, &mut tracker, &history, args.fresh)?;
+    let mut last_history_id = history.max_id()?;
     let heartbeat_interval = args.heartbeat_duration();
     let ui_tick = Duration::from_millis(50);
     let mut last_heartbeat = Instant::now();
-
-    if args.log_file.is_none() {
-        let mut discovered_paths = discover_initial_session_logs();
-        let mut tailer = tailer::MultiTailer::new(
-            discovered_paths,
-            !args.no_follow,
-            args.from_start,
-            args.poll_duration(),
-            Duration::from_secs(MISSING_TTL_SECONDS),
-        );
-        let mut last_scan = Instant::now();
-
-        loop {
-            if handle_input(&mut app, ui_tick)? {
-                break;
-            }
-
-            let now = Instant::now();
-            if now.duration_since(last_heartbeat) >= heartbeat_interval {
-                app.ingest_heartbeat(tracker.heartbeat(Utc::now()), Utc::now());
-                last_heartbeat = now;
-            }
-
-            if !args.no_follow && now.duration_since(last_scan) >= tailer.poll_interval() {
-                discovered_paths = discover_initial_session_logs();
-                tailer.sync(discovered_paths);
-                last_scan = now;
-            }
-
-            drain_multi_tailer(&mut tailer, &mut history, &mut tracker, &mut app);
-            app.refresh_session_labels(Utc::now());
-            terminal.draw(|frame| render(frame, &mut app))?;
-        }
-
-        return Ok(());
-    }
-
-    let Some(log_file) = args.log_file.clone() else {
-        return Ok(());
-    };
-
-    let mut tailer = match tailer::Tailer::new(
-        log_file.clone(),
-        !args.no_follow,
-        args.from_start,
-        args.poll_duration(),
-    ) {
-        Ok(state) => state,
-        Err(err) => {
-            app.ingest_error(
-                format!("failed to open {}: {err}", log_file.display()),
-                Utc::now(),
-            );
-            loop {
-                app.refresh_session_labels(Utc::now());
-                terminal.draw(|frame| render(frame, &mut app))?;
-                if handle_input(&mut app, ui_tick)? {
-                    break;
-                }
-            }
-            return Ok(());
-        }
-    };
 
     loop {
         if handle_input(&mut app, ui_tick)? {
@@ -1694,7 +1633,13 @@ fn run_app(
             last_heartbeat = now;
         }
 
-        drain_single_tailer(&mut tailer, &log_file, &mut history, &mut tracker, &mut app);
+        refresh_history(
+            &mut app,
+            &mut tracker,
+            &history,
+            &mut last_history_id,
+            args.stale_seconds,
+        )?;
         app.refresh_session_labels(Utc::now());
         terminal.draw(|frame| render(frame, &mut app))?;
     }
@@ -1869,65 +1814,60 @@ fn perform_action(app: &mut App, action: Action) -> bool {
     }
 }
 
-fn drain_multi_tailer(
-    tailer: &mut tailer::MultiTailer,
-    history: &mut PersistedHistory,
-    tracker: &mut StaleTracker,
+fn refresh_history(
     app: &mut App,
-) {
-    for _ in 0..DRAIN_PER_TICK {
-        match tailer.next_line() {
-            Ok(Some((path, raw_line))) => {
-                ingest_line(&raw_line, Some(path.as_path()), history, tracker, app)
-            }
-            Ok(None) => break,
-            Err(err) => {
-                app.ingest_error(err.to_string(), Utc::now());
-                break;
-            }
-        }
+    tracker: &mut StaleTracker,
+    history: &PersistedHistory,
+    last_history_id: &mut i64,
+    stale_after_seconds: u64,
+) -> io::Result<usize> {
+    let restored = history.load_after_id(*last_history_id, DRAIN_PER_TICK)?;
+    if restored.is_empty() {
+        return Ok(0);
     }
+
+    let restored_count = restored.len();
+    ingest_persisted_events(app, tracker, restored, last_history_id);
+    if app.event_count() > HISTORY_LIMIT {
+        rebuild_history_view(app, tracker, history, last_history_id, stale_after_seconds)?;
+    }
+    Ok(restored_count)
 }
 
-fn drain_single_tailer(
-    tailer: &mut tailer::Tailer,
-    log_file: &Path,
-    history: &mut PersistedHistory,
-    tracker: &mut StaleTracker,
+fn ingest_persisted_events(
     app: &mut App,
-) {
-    for _ in 0..DRAIN_PER_TICK {
-        match tailer.next_line() {
-            Ok(Some(raw_line)) => ingest_line(&raw_line, Some(log_file), history, tracker, app),
-            Ok(None) => break,
-            Err(err) => {
-                app.ingest_error(err.to_string(), Utc::now());
-                break;
-            }
-        }
-    }
-}
-
-fn ingest_line(
-    raw_line: &str,
-    source_path: Option<&Path>,
-    history: &mut PersistedHistory,
     tracker: &mut StaleTracker,
-    app: &mut App,
+    persisted_events: Vec<PersistedEvent>,
+    last_history_id: &mut i64,
 ) {
-    let now = Utc::now();
-    for event in normalize_many_with_source(raw_line, source_path) {
-        let warnings = tracker.on_event(&event, now);
-        if let Err(err) = history.append(now, &event) {
-            app.ingest_error(format!("failed to persist history: {err}"), now);
-        }
-        app.ingest_event(event, now);
+    for persisted in persisted_events {
+        *last_history_id = (*last_history_id).max(persisted.id);
+        let event_time = persisted.event.timestamp.unwrap_or(persisted.observed_at);
+        let warnings = tracker.on_event(&persisted.event, event_time);
+        app.ingest_event(persisted.event, persisted.observed_at);
         for warning in warnings {
-            if app.filters.time.contains(Some(now)) {
-                app.ingest_warning(warning, now);
+            if app.filters.time.contains(Some(event_time)) {
+                app.ingest_warning(warning, event_time);
             }
         }
     }
+}
+
+fn rebuild_history_view(
+    app: &mut App,
+    tracker: &mut StaleTracker,
+    history: &PersistedHistory,
+    last_history_id: &mut i64,
+    stale_after_seconds: u64,
+) -> io::Result<()> {
+    let filters = app.filters.clone();
+    let mut rebuilt = App::new(filters, stale_after_seconds);
+    let mut rebuilt_tracker = StaleTracker::new(stale_after_seconds);
+    restore_history(&mut rebuilt, &mut rebuilt_tracker, history, false)?;
+    *last_history_id = history.max_id()?;
+    *app = rebuilt;
+    *tracker = rebuilt_tracker;
+    Ok(())
 }
 
 fn restore_history(
@@ -1943,7 +1883,8 @@ fn restore_history(
     let restored = history.load_recent()?;
     let restored_count = restored.len();
     for persisted in restored {
-        tracker.on_event(&persisted.event, persisted.observed_at);
+        let event_time = persisted.event.timestamp.unwrap_or(persisted.observed_at);
+        tracker.on_event(&persisted.event, event_time);
         app.ingest_event(persisted.event, persisted.observed_at);
     }
     Ok(restored_count)
@@ -2104,7 +2045,12 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
         ],
     };
 
-    let table_rows = rows
+    let visible_height = area.height.saturating_sub(3).max(1) as usize;
+    let row_start = tab_state.scroll_offset.min(rows.len());
+    let row_end = row_start.saturating_add(visible_height).min(rows.len());
+    let visible_selection = selected_index
+        .and_then(|index| (index >= row_start && index < row_end).then_some(index - row_start));
+    let table_rows = rows[row_start..row_end]
         .iter()
         .map(|row| Row::new(row.cells.clone()))
         .collect::<Vec<_>>();
@@ -2122,8 +2068,8 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         );
 
-    let mut state = TableState::default().with_offset(tab_state.scroll_offset);
-    state.select(selected_index);
+    let mut state = TableState::default();
+    state.select(visible_selection);
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -2376,20 +2322,6 @@ fn truncate_display(value: &str, max_chars: usize) -> String {
         .collect::<String>();
     shortened.push('…');
     shortened
-}
-
-fn discover_initial_session_logs() -> Vec<PathBuf> {
-    let home_dir = env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from);
-
-    match home_dir {
-        Some(home) => {
-            let root = home.join(".openclaw");
-            discovery::discover_session_logs(&root).unwrap_or_else(|_| Vec::new())
-        }
-        None => Vec::new(),
-    }
 }
 
 fn format_filters(args: &Args) -> String {

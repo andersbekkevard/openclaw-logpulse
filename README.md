@@ -44,14 +44,17 @@ Use `--force` so the installed binary is replaced even when the package version 
 ## Usage
 
 ```bash
-# Default: launch the interactive TUI (auto-discovers OpenClaw session logs)
+# Start the collector daemon (keeps the SQLite store current)
+logpulse daemon
+
+# Default: launch the interactive TUI as a view of the SQLite store
 logpulse
 
 # Launch the TUI without restoring persisted history for this run
 logpulse tui --fresh
 
-# Follow from beginning of discovered source in the TUI
-logpulse --from-start
+# One-shot backfill of discovered sources into the SQLite store
+logpulse daemon --no-follow
 
 # Filter the TUI by session, agent, and tool
 logpulse --session "session-12" --agent "agent-7" --tool shell
@@ -92,6 +95,7 @@ logpulse tui clear
 - `--from-start` start from file start.
 - `--no-follow` read existing content only.
 - `--fresh` skip restoring persisted TUI history for this run. `logpulse tui --fresh` is the explicit TUI form.
+- `daemon` collect discovered OpenClaw session logs into `~/.openclaw/logpulse/history.sqlite3`.
 - `tui clear` delete the persisted TUI history store at `~/.openclaw/logpulse/history.sqlite3`.
 
 ### TUI controls
@@ -104,23 +108,15 @@ logpulse tui clear
 
 The timeline is intentionally compact while the detail pane shows the decoded event metadata plus a pretty-printed raw payload, so you can read things like exec commands, memory queries, and tool results without staring at compressed JSON soup.
 
-The TUI restores up to the newest 10,000 normalized events from a global SQLite history store at startup before attaching to live log streams. Use `logpulse tui clear` to wipe that store; in-TUI clearing remains viewport-only and does not delete persisted history.
+The TUI restores up to the newest 10,000 normalized events from a global SQLite history store and polls that store for updates. It does not own log collection; run `logpulse daemon` in the background to keep events current even while the TUI is closed. Use `logpulse tui clear` to wipe that store; in-TUI clearing remains viewport-only and does not delete persisted history.
 
-Auto-discovery checks these sources, in order:
+Auto-discovery scans `~/.openclaw/agents/*/sessions` for OpenClaw transcript files:
 
-- `OPENCLAW_LOG_FILE`
-- `OPENCLAW_LOG_PATH`
-- `OPENCLAW_LOG_DIR/openclaw.log`
-- `OPENCLAW_LOG_DIR/logs/openclaw.log`
-- `OPENCLAW_HOME/openclaw.log`
-- `OPENCLAW_HOME/logs/openclaw.log`
-- `OPENCLAW_BASE_DIR/openclaw.log`
-- `OPENCLAW_BASE_DIR/logs/openclaw.log`
-- `~/.openclaw/openclaw.log`
-- `~/.openclaw/logs/openclaw.log`
-- `~/.cache/openclaw/openclaw.log`
-- `/var/log/openclaw.log`
-- `/var/log/openclaw/openclaw.log`
+- active `<session-id>.jsonl` files
+- reset archives named `<session-id>.jsonl.reset.<timestamp>`
+- deleted archives named `<session-id>.jsonl.deleted.<timestamp>`
+
+It ignores `sessions.json`, lock files, trajectory sidecars, and unrelated JSONL.
 
 ## Discord Channel Names
 
