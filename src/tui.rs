@@ -191,11 +191,94 @@ struct NoticeRecord {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct VisibleRow {
     key: EntityKey,
     cells: Vec<String>,
     searchable: String,
+}
+
+#[derive(Clone, Debug)]
+struct VisibleRowItem {
+    key: EntityKey,
+    searchable: String,
     sort_at: DateTime<Utc>,
+    cells: VisibleRowCells,
+}
+
+#[derive(Clone, Debug)]
+enum VisibleRowCells {
+    Event {
+        row: EventRow,
+        display_label: String,
+    },
+    Notice(Vec<String>),
+    Call {
+        call: CorrelatedCall,
+        display_label: String,
+    },
+    Session {
+        session: SessionSummary,
+        display_label: String,
+        health: String,
+    },
+}
+
+impl VisibleRowItem {
+    fn to_visible_row(&self) -> VisibleRow {
+        VisibleRow {
+            key: self.key.clone(),
+            cells: self.cells(),
+            searchable: self.searchable.clone(),
+        }
+    }
+
+    fn cells(&self) -> Vec<String> {
+        match &self.cells {
+            VisibleRowCells::Event { row, display_label } => vec![
+                format_ts(row.timestamp.unwrap_or(self.sort_at)),
+                kind_label(&row.kind).to_string(),
+                truncate_display(row.agent_id.as_deref().unwrap_or("-"), 10),
+                truncate_display(display_label, 20),
+                truncate_display(row.tool_name.as_deref().unwrap_or("-"), 14),
+                truncate_display(row.status.as_deref().unwrap_or("-"), 14),
+                truncate_display(row.preview.as_deref().unwrap_or("-"), PREVIEW_LEN),
+            ],
+            VisibleRowCells::Notice(cells) => cells.clone(),
+            VisibleRowCells::Call {
+                call,
+                display_label,
+            } => vec![
+                format_ts(
+                    call.started_at
+                        .or(call.last_updated_at)
+                        .unwrap_or(self.sort_at),
+                ),
+                call_status_label(call.status.clone()).to_string(),
+                truncate_display(call.agent_id.as_deref().unwrap_or("-"), 12),
+                truncate_display(display_label, 20),
+                truncate_display(call.tool_name.as_deref().unwrap_or("-"), 14),
+                match call.duration_ms {
+                    Some(ms) => format!("{ms}ms"),
+                    None => "-".to_string(),
+                },
+                truncate_display(call.message_preview.as_deref().unwrap_or("-"), PREVIEW_LEN),
+            ],
+            VisibleRowCells::Session {
+                session,
+                display_label,
+                health,
+            } => vec![
+                format_ts(session.last_activity_at.unwrap_or(self.sort_at)),
+                truncate_display(session.agent_id.as_deref().unwrap_or("-"), 12),
+                truncate_display(display_label, 22),
+                health.clone(),
+                session.open_call_count.to_string(),
+                session.stale_call_count.to_string(),
+                severity_label(session.derived_severity).to_string(),
+            ],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -704,14 +787,21 @@ impl App {
     }
 
     fn visible_rows(&self, tab: Tab) -> Vec<VisibleRow> {
+        self.visible_row_items(tab)
+            .iter()
+            .map(VisibleRowItem::to_visible_row)
+            .collect()
+    }
+
+    fn visible_row_items(&self, tab: Tab) -> Vec<VisibleRowItem> {
         match tab {
-            Tab::Events => self.visible_event_rows(),
-            Tab::Calls => self.visible_call_rows(),
-            Tab::Sessions => self.visible_session_rows(),
+            Tab::Events => self.visible_event_row_items(),
+            Tab::Calls => self.visible_call_row_items(),
+            Tab::Sessions => self.visible_session_row_items(),
         }
     }
 
-    fn visible_event_rows(&self) -> Vec<VisibleRow> {
+    fn visible_event_row_items(&self) -> Vec<VisibleRowItem> {
         let state = self.tab_state(Tab::Events);
         let scope = &state.scope;
         let call_scope = scope.call_entity_id.as_ref().and_then(|call_id| {
@@ -759,7 +849,8 @@ impl App {
             })
             .map(|row| {
                 let display_label = self.display_event_label(&row);
-                VisibleRow {
+                let sort_at = row.timestamp.unwrap_or(self.now);
+                VisibleRowItem {
                     key: EntityKey::Event(row.event_ref.clone()),
                     searchable: [
                         display_label.clone(),
@@ -769,21 +860,13 @@ impl App {
                         row.preview.clone().unwrap_or_default(),
                     ]
                     .join(" "),
-                    sort_at: row.timestamp.unwrap_or(self.now),
-                    cells: vec![
-                        format_ts(row.timestamp.unwrap_or(self.now)),
-                        kind_label(&row.kind).to_string(),
-                        truncate_display(row.agent_id.as_deref().unwrap_or("-"), 10),
-                        truncate_display(&display_label, 20),
-                        truncate_display(row.tool_name.as_deref().unwrap_or("-"), 14),
-                        truncate_display(row.status.as_deref().unwrap_or("-"), 14),
-                        truncate_display(row.preview.as_deref().unwrap_or("-"), PREVIEW_LEN),
-                    ],
+                    sort_at,
+                    cells: VisibleRowCells::Event { row, display_label },
                 }
             })
             .collect::<Vec<_>>();
 
-        rows.extend(self.visible_notice_rows(scope));
+        rows.extend(self.visible_notice_row_items(scope));
 
         rows.sort_by(|a, b| {
             b.sort_at
@@ -793,7 +876,7 @@ impl App {
         rows
     }
 
-    fn visible_notice_rows(&self, scope: &DrilldownScope) -> Vec<VisibleRow> {
+    fn visible_notice_row_items(&self, scope: &DrilldownScope) -> Vec<VisibleRowItem> {
         let scoped_call = scope
             .call_entity_id
             .as_ref()
@@ -826,9 +909,9 @@ impl App {
                     if !self.matches_text_search(&[&searchable]) {
                         return None;
                     }
-                    Some(VisibleRow {
+                    Some(VisibleRowItem {
                         key: EntityKey::Notice(notice.id.clone()),
-                        cells: vec![
+                        cells: VisibleRowCells::Notice(vec![
                             format_ts(notice.seen_at),
                             "STALE".to_string(),
                             truncate_display(warning.session_key.as_deref().unwrap_or("-"), 20),
@@ -839,7 +922,7 @@ impl App {
                                 warning.message.as_deref().unwrap_or("Long-running call"),
                                 PREVIEW_LEN,
                             ),
-                        ],
+                        ]),
                         searchable,
                         sort_at: notice.seen_at,
                     })
@@ -851,9 +934,9 @@ impl App {
                     if !self.matches_text_search(&[&searchable]) {
                         return None;
                     }
-                    Some(VisibleRow {
+                    Some(VisibleRowItem {
                         key: EntityKey::Notice(notice.id.clone()),
-                        cells: vec![
+                        cells: VisibleRowCells::Notice(vec![
                             format_ts(notice.seen_at),
                             "HB".to_string(),
                             "-".to_string(),
@@ -861,7 +944,7 @@ impl App {
                             "heartbeat".to_string(),
                             format!("a={} s={}", summary.active_calls, summary.stale_calls),
                             truncate_display(&summary.to_line(), PREVIEW_LEN),
-                        ],
+                        ]),
                         searchable,
                         sort_at: notice.seen_at,
                     })
@@ -872,9 +955,9 @@ impl App {
                     if !self.matches_text_search(&[message]) {
                         return None;
                     }
-                    Some(VisibleRow {
+                    Some(VisibleRowItem {
                         key: EntityKey::Notice(notice.id.clone()),
-                        cells: vec![
+                        cells: VisibleRowCells::Notice(vec![
                             format_ts(notice.seen_at),
                             "ERR".to_string(),
                             "system".to_string(),
@@ -882,7 +965,7 @@ impl App {
                             "error".to_string(),
                             "error".to_string(),
                             truncate_display(message, PREVIEW_LEN),
-                        ],
+                        ]),
                         searchable: message.clone(),
                         sort_at: notice.seen_at,
                     })
@@ -892,7 +975,7 @@ impl App {
             .collect()
     }
 
-    fn visible_call_rows(&self) -> Vec<VisibleRow> {
+    fn visible_call_row_items(&self) -> Vec<VisibleRowItem> {
         let state = self.tab_state(Tab::Calls);
         self.store
             .correlated_calls(&self.projection_filter(), self.now, &self.health)
@@ -923,7 +1006,8 @@ impl App {
                     Some(call.session_id.as_str()),
                     Some(call.session_label.as_str()),
                 );
-                VisibleRow {
+                let sort_at = call.started_at.or(call.last_updated_at).unwrap_or(self.now);
+                VisibleRowItem {
                     key: EntityKey::Call(call.call_entity_id.clone()),
                     searchable: [
                         display_label.clone(),
@@ -932,28 +1016,17 @@ impl App {
                         call.message_preview.clone().unwrap_or_default(),
                     ]
                     .join(" "),
-                    sort_at: call.started_at.or(call.last_updated_at).unwrap_or(self.now),
-                    cells: vec![
-                        format_ts(call.started_at.or(call.last_updated_at).unwrap_or(self.now)),
-                        call_status_label(call.status).to_string(),
-                        truncate_display(call.agent_id.as_deref().unwrap_or("-"), 12),
-                        truncate_display(&display_label, 20),
-                        truncate_display(call.tool_name.as_deref().unwrap_or("-"), 14),
-                        match call.duration_ms {
-                            Some(ms) => format!("{ms}ms"),
-                            None => "-".to_string(),
-                        },
-                        truncate_display(
-                            call.message_preview.as_deref().unwrap_or("-"),
-                            PREVIEW_LEN,
-                        ),
-                    ],
+                    sort_at,
+                    cells: VisibleRowCells::Call {
+                        call,
+                        display_label,
+                    },
                 }
             })
             .collect()
     }
 
-    fn visible_session_rows(&self) -> Vec<VisibleRow> {
+    fn visible_session_row_items(&self) -> Vec<VisibleRowItem> {
         self.store
             .sessions(&self.projection_filter(), self.now, &self.health)
             .into_iter()
@@ -980,7 +1053,8 @@ impl App {
                     Some(session.session_id.as_str()),
                     Some(session.session_label.as_str()),
                 );
-                VisibleRow {
+                let sort_at = session.last_activity_at.unwrap_or(self.now);
+                VisibleRowItem {
                     key: EntityKey::Session(session.session_id.clone()),
                     searchable: [
                         display_label.clone(),
@@ -988,16 +1062,12 @@ impl App {
                         health.clone(),
                     ]
                     .join(" "),
-                    sort_at: session.last_activity_at.unwrap_or(self.now),
-                    cells: vec![
-                        format_ts(session.last_activity_at.unwrap_or(self.now)),
-                        truncate_display(session.agent_id.as_deref().unwrap_or("-"), 12),
-                        truncate_display(&display_label, 22),
+                    sort_at,
+                    cells: VisibleRowCells::Session {
+                        session,
+                        display_label,
                         health,
-                        session.open_call_count.to_string(),
-                        session.stale_call_count.to_string(),
-                        severity_label(session.derived_severity).to_string(),
-                    ],
+                    },
                 }
             })
             .collect()
@@ -1014,6 +1084,14 @@ impl App {
     }
 
     fn selected_index(&self, tab: Tab, rows: &[VisibleRow]) -> Option<usize> {
+        self.tab_state(tab)
+            .selected
+            .as_ref()
+            .and_then(|selected| rows.iter().position(|row| &row.key == selected))
+            .or_else(|| (!rows.is_empty()).then_some(0))
+    }
+
+    fn selected_item_index(&self, tab: Tab, rows: &[VisibleRowItem]) -> Option<usize> {
         self.tab_state(tab)
             .selected
             .as_ref()
@@ -1997,8 +2075,8 @@ fn render_workspace(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_list(frame: &mut Frame, area: Rect, app: &App) {
-    let rows = app.visible_rows(app.current_tab);
-    let selected_index = app.selected_index(app.current_tab, &rows);
+    let rows = app.visible_row_items(app.current_tab);
+    let selected_index = app.selected_item_index(app.current_tab, &rows);
     let tab_state = app.current_tab_state();
     let widths = match app.current_tab {
         Tab::Events => [
@@ -2052,7 +2130,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &App) {
         .and_then(|index| (index >= row_start && index < row_end).then_some(index - row_start));
     let table_rows = rows[row_start..row_end]
         .iter()
-        .map(|row| Row::new(row.cells.clone()))
+        .map(|row| Row::new(row.cells()))
         .collect::<Vec<_>>();
     let table = Table::new(table_rows, widths)
         .header(Row::new(header).style(Style::default().add_modifier(Modifier::BOLD)))
@@ -2184,7 +2262,7 @@ fn rendered_text_lines(text: &Text, width: usize) -> usize {
         .lines()
         .map(|line| {
             let len = line.to_string().chars().count().max(1);
-            (len + width - 1) / width
+            len.div_ceil(width)
         })
         .sum()
 }

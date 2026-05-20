@@ -532,9 +532,7 @@ fn extract_discord_channel_from_session_key(
             return None;
         }
 
-        let Some(channel_id) = parts.get(idx + 2).map(|value| value.trim()) else {
-            return None;
-        };
+        let channel_id = parts.get(idx + 2).map(|value| value.trim())?;
 
         if is_valid_discord_channel_id(channel_id) {
             return Some(channel_id.to_string());
