@@ -35,7 +35,7 @@ impl LevelArg {
     name = "logpulse",
     version,
     about = "Live visibility for OpenClaw tool calls",
-    after_help = "Special commands:\n  logpulse daemon         Collect OpenClaw session events into the SQLite store\n  logpulse tui --fresh    Launch the TUI without restoring persisted history\n  logpulse tui clear      Delete the persisted TUI history store"
+    after_help = "Special commands:\n  logpulse daemon         Run the collector explicitly (the TUI auto-starts it when following)\n  logpulse tui --fresh    Launch the TUI without restoring persisted history\n  logpulse tui clear      Delete the persisted TUI history store"
 )]
 pub struct Args {
     #[arg(value_name = "LOG_FILE")]

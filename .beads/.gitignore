@@ -36,6 +36,7 @@ dolt-monitor.pid
 
 # Backup data (auto-exported JSONL, local-only)
 backup/
+.br_history/
 
 # Legacy files (from pre-Dolt versions)
 *.db

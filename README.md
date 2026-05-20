@@ -44,11 +44,11 @@ Use `--force` so the installed binary is replaced even when the package version 
 ## Usage
 
 ```bash
-# Start the collector daemon (keeps the SQLite store current)
-logpulse daemon
-
-# Default: launch the interactive TUI as a view of the SQLite store
+# Default: launch the TUI; it auto-starts the collector while following
 logpulse
+
+# Run the collector explicitly (useful for services or manual debugging)
+logpulse daemon
 
 # Launch the TUI without restoring persisted history for this run
 logpulse tui --fresh
@@ -95,8 +95,7 @@ logpulse tui clear
 - `--from-start` start from file start.
 - `--no-follow` read existing content only.
 - `--fresh` skip restoring persisted TUI history for this run. `logpulse tui --fresh` is the explicit TUI form.
-- `daemon` collect discovered OpenClaw session logs into `~/.openclaw/logpulse/history.sqlite3`.
-  The TUI auto-starts this collector when following so new rows keep arriving even though rendering is database-backed.
+- `daemon` run the collector explicitly. The TUI auto-starts this collector while following, so new rows keep arriving even though rendering is database-backed.
 - `tui clear` delete the persisted TUI history store at `~/.openclaw/logpulse/history.sqlite3`.
 
 ### TUI controls
