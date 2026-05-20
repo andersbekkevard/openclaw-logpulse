@@ -31,6 +31,9 @@ const DRAIN_PER_TICK: usize = 128;
 const PREVIEW_LEN: usize = 72;
 const SESSION_LABEL_CACHE_TTL_MINUTES: i64 = 15;
 const SCROLL_OFF: usize = 5;
+const UI_TICK: Duration = Duration::from_millis(50);
+const MAX_INPUT_DRAIN: usize = 512;
+const SESSION_LABEL_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Tab {
@@ -95,6 +98,21 @@ enum EntityKey {
 enum FollowMode {
     Follow,
     Browse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputOutcome {
+    Idle,
+    Redraw,
+    Quit,
+}
+
+#[derive(Default)]
+struct PendingInput {
+    row_delta: isize,
+    scroll_delta: isize,
+    saw_resize: bool,
+    changed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -883,15 +901,20 @@ impl App {
         self.search_draft.clear();
     }
 
+    #[allow(dead_code)]
     fn ingest_event(&mut self, event: NormalizedEvent, observed_at: DateTime<Utc>) {
         let before = self.snapshot_visible_keys();
+        self.ingest_event_record(event, observed_at);
+        self.reconcile_after_data_change(before);
+    }
+
+    fn ingest_event_record(&mut self, event: NormalizedEvent, observed_at: DateTime<Utc>) {
         if let Some(input) = SessionLabelInput::from_event(&event) {
             self.session_labels.observe_session(input, observed_at);
         }
         let event_ref = self.store.ingest_event(event.clone(), observed_at);
         self.events_by_ref.insert(event_ref, event);
         self.now = observed_at;
-        self.reconcile_after_data_change(before);
     }
 
     fn event_count(&self) -> usize {
@@ -902,27 +925,30 @@ impl App {
         self.session_labels.refresh(now)
     }
 
+    #[allow(dead_code)]
     fn ingest_warning(&mut self, warning: StaleWarning, observed_at: DateTime<Utc>) {
         let before = self.snapshot_visible_keys();
-        self.push_notice(NoticeKind::Stale(warning), observed_at);
-        self.now = observed_at;
+        self.ingest_notice_record(NoticeKind::Stale(warning), observed_at);
         self.reconcile_after_data_change(before);
     }
 
     fn ingest_heartbeat(&mut self, summary: HeartbeatSummary, observed_at: DateTime<Utc>) {
         let before = self.snapshot_visible_keys();
         self.latest_heartbeat = Some(summary.clone());
-        self.push_notice(NoticeKind::Heartbeat(summary), observed_at);
-        self.now = observed_at;
+        self.ingest_notice_record(NoticeKind::Heartbeat(summary), observed_at);
         self.reconcile_after_data_change(before);
     }
 
     #[allow(dead_code)]
     fn ingest_error(&mut self, message: impl Into<String>, observed_at: DateTime<Utc>) {
         let before = self.snapshot_visible_keys();
-        self.push_notice(NoticeKind::Error(message.into()), observed_at);
-        self.now = observed_at;
+        self.ingest_notice_record(NoticeKind::Error(message.into()), observed_at);
         self.reconcile_after_data_change(before);
+    }
+
+    fn ingest_notice_record(&mut self, kind: NoticeKind, seen_at: DateTime<Utc>) {
+        self.push_notice(kind, seen_at);
+        self.now = seen_at;
     }
 
     fn push_notice(&mut self, kind: NoticeKind, seen_at: DateTime<Utc>) {
@@ -937,25 +963,13 @@ impl App {
     fn snapshot_visible_keys(&self) -> HashMap<Tab, Vec<EntityKey>> {
         Tab::ALL
             .into_iter()
-            .map(|tab| {
-                (
-                    tab,
-                    self.visible_rows(tab)
-                        .into_iter()
-                        .map(|row| row.key)
-                        .collect::<Vec<_>>(),
-                )
-            })
+            .map(|tab| (tab, self.visible_keys(tab)))
             .collect()
     }
 
     fn reconcile_after_data_change(&mut self, before: HashMap<Tab, Vec<EntityKey>>) {
         for tab in Tab::ALL {
-            let after_rows = self.visible_rows(tab);
-            let after_keys = after_rows
-                .iter()
-                .map(|row| row.key.clone())
-                .collect::<Vec<_>>();
+            let after_keys = self.visible_keys(tab);
             let state = self.tab_state_mut(tab);
             if after_keys.is_empty() {
                 state.selected = None;
@@ -1017,6 +1031,13 @@ impl App {
         self.visible_row_items(tab)
             .iter()
             .map(VisibleRowItem::to_visible_row)
+            .collect()
+    }
+
+    fn visible_keys(&self, tab: Tab) -> Vec<EntityKey> {
+        self.visible_row_items(tab)
+            .into_iter()
+            .map(|row| row.key)
             .collect()
     }
 
@@ -1323,14 +1344,6 @@ impl App {
             .any(|value| value.to_ascii_lowercase().contains(&needle))
     }
 
-    fn selected_index(&self, tab: Tab, rows: &[VisibleRow]) -> Option<usize> {
-        self.tab_state(tab)
-            .selected
-            .as_ref()
-            .and_then(|selected| rows.iter().position(|row| &row.key == selected))
-            .or_else(|| (!rows.is_empty()).then_some(0))
-    }
-
     fn selected_item_index(&self, tab: Tab, rows: &[VisibleRowItem]) -> Option<usize> {
         self.tab_state(tab)
             .selected
@@ -1340,7 +1353,7 @@ impl App {
     }
 
     fn resume_live(&mut self) {
-        let rows = self.visible_rows(self.current_tab);
+        let rows = self.visible_row_items(self.current_tab);
         let state = self.current_tab_state_mut();
         state.follow_mode = FollowMode::Follow;
         state.unseen_count = 0;
@@ -1349,11 +1362,13 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let rows = self.visible_rows(self.current_tab);
+        let rows = self.visible_row_items(self.current_tab);
         if rows.is_empty() {
             return;
         }
-        let current_index = self.selected_index(self.current_tab, &rows).unwrap_or(0) as isize;
+        let current_index = self
+            .selected_item_index(self.current_tab, &rows)
+            .unwrap_or(0) as isize;
         let next_index = (current_index + delta).clamp(0, rows.len().saturating_sub(1) as isize);
         let state = self.current_tab_state_mut();
         state.follow_mode = FollowMode::Browse;
@@ -1361,8 +1376,19 @@ impl App {
         state.scroll_offset = list_scroll_offset(next_index as usize, SCROLL_OFF);
     }
 
+    fn scroll_active_layer(&mut self, delta: isize) {
+        if self.help_open {
+            let max = self.help_scroll_limit();
+            self.help_scroll = clamp_signed_delta(self.help_scroll, delta, max);
+        } else if let Some(max) = self.detail.as_ref().map(|_| self.detail_scroll_limit()) {
+            if let Some(detail) = self.detail.as_mut() {
+                detail.scroll = clamp_signed_delta(detail.scroll, delta, max);
+            }
+        }
+    }
+
     fn jump_to(&mut self, index: usize) {
-        let rows = self.visible_rows(self.current_tab);
+        let rows = self.visible_row_items(self.current_tab);
         if rows.is_empty() {
             return;
         }
@@ -1376,7 +1402,7 @@ impl App {
     fn switch_tab(&mut self, tab: Tab) {
         self.current_tab = tab;
         if self.current_tab_state().follow_mode == FollowMode::Follow {
-            let rows = self.visible_rows(tab);
+            let rows = self.visible_row_items(tab);
             let target = self.tab_state_mut(tab);
             target.unseen_count = 0;
             target.scroll_offset = 0;
@@ -1974,29 +2000,43 @@ fn run_app(
     restore_history(&mut app, &mut tracker, &history, args.fresh)?;
     let mut last_history_id = history.max_id()?;
     let heartbeat_interval = args.heartbeat_duration();
-    let ui_tick = Duration::from_millis(50);
     let mut last_heartbeat = Instant::now();
+    let mut last_label_refresh = Instant::now() - SESSION_LABEL_REFRESH_INTERVAL;
+    terminal.draw(|frame| render(frame, &mut app))?;
 
     loop {
-        if handle_input(&mut app, ui_tick)? {
-            break;
-        }
+        let mut needs_draw = match handle_input(&mut app, UI_TICK)? {
+            InputOutcome::Idle => false,
+            InputOutcome::Redraw => true,
+            InputOutcome::Quit => break,
+        };
 
         let now = Instant::now();
         if now.duration_since(last_heartbeat) >= heartbeat_interval {
             app.ingest_heartbeat(tracker.heartbeat(Utc::now()), Utc::now());
             last_heartbeat = now;
+            needs_draw = true;
         }
 
-        refresh_history(
+        if refresh_history(
             &mut app,
             &mut tracker,
             &history,
             &mut last_history_id,
             args.stale_seconds,
-        )?;
-        app.refresh_session_labels(Utc::now());
-        terminal.draw(|frame| render(frame, &mut app))?;
+        )? > 0
+        {
+            needs_draw = true;
+        }
+        if now.duration_since(last_label_refresh) >= SESSION_LABEL_REFRESH_INTERVAL {
+            last_label_refresh = now;
+            if app.refresh_session_labels(Utc::now()) {
+                needs_draw = true;
+            }
+        }
+        if needs_draw {
+            terminal.draw(|frame| render(frame, &mut app))?;
+        }
     }
 
     Ok(())
@@ -2020,41 +2060,118 @@ fn active_bindings(layer: ActiveLayer, tab: Tab) -> Vec<&'static KeyBinding> {
         .collect()
 }
 
-fn handle_input(app: &mut App, timeout: Duration) -> io::Result<bool> {
+fn handle_input(app: &mut App, timeout: Duration) -> io::Result<InputOutcome> {
     if !event::poll(timeout)? {
-        return Ok(false);
+        return Ok(InputOutcome::Idle);
     }
 
-    if let Event::Key(key) = event::read()? {
-        if key.kind != KeyEventKind::Press {
-            return Ok(false);
-        }
-
-        if app.search_open {
-            return Ok(handle_search_input(app, &key));
-        }
-
-        if app.awaiting_gg {
-            app.awaiting_gg = false;
-            if key.code == KeyCode::Char('g') {
-                return Ok(perform_action(app, Action::FirstRow));
+    let mut pending = PendingInput::default();
+    for _ in 0..MAX_INPUT_DRAIN {
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if process_key_input(app, &key, &mut pending) {
+                    return Ok(InputOutcome::Quit);
+                }
             }
-
-            if let Some(action) = resolve_action(app, &key) {
-                return Ok(perform_action(app, action));
+            Event::Resize(_, _) => {
+                pending.saw_resize = true;
             }
-
-            return Ok(false);
+            _ => {}
         }
 
-        let Some(action) = resolve_action(app, &key) else {
-            return Ok(false);
-        };
-
-        return Ok(perform_action(app, action));
+        if !event::poll(Duration::ZERO)? {
+            break;
+        }
     }
 
-    Ok(false)
+    flush_pending_input(app, &mut pending);
+    if pending.changed || pending.saw_resize {
+        Ok(InputOutcome::Redraw)
+    } else {
+        Ok(InputOutcome::Idle)
+    }
+}
+
+fn process_key_input(app: &mut App, key: &KeyEvent, pending: &mut PendingInput) -> bool {
+    if app.search_open {
+        flush_pending_input(app, pending);
+        pending.changed = true;
+        return handle_search_input(app, key);
+    }
+
+    if app.awaiting_gg {
+        flush_pending_input(app, pending);
+        app.awaiting_gg = false;
+        if key.code == KeyCode::Char('g') {
+            pending.changed = true;
+            return perform_action(app, Action::FirstRow);
+        }
+
+        if let Some(action) = resolve_action(app, key) {
+            pending.changed = true;
+            return perform_action(app, action);
+        }
+
+        pending.changed = true;
+        return false;
+    }
+
+    let Some(action) = resolve_action(app, key) else {
+        return false;
+    };
+
+    match action {
+        Action::NextRow => {
+            flush_pending_scroll(app, pending);
+            pending.row_delta = pending.row_delta.saturating_add(1);
+            pending.changed = true;
+            false
+        }
+        Action::PreviousRow => {
+            flush_pending_scroll(app, pending);
+            pending.row_delta = pending.row_delta.saturating_sub(1);
+            pending.changed = true;
+            false
+        }
+        Action::ScrollDown => {
+            flush_pending_rows(app, pending);
+            pending.scroll_delta = pending.scroll_delta.saturating_add(1);
+            pending.changed = true;
+            false
+        }
+        Action::ScrollUp => {
+            flush_pending_rows(app, pending);
+            pending.scroll_delta = pending.scroll_delta.saturating_sub(1);
+            pending.changed = true;
+            false
+        }
+        _ => {
+            flush_pending_input(app, pending);
+            pending.changed = true;
+            perform_action(app, action)
+        }
+    }
+}
+
+fn flush_pending_input(app: &mut App, pending: &mut PendingInput) {
+    flush_pending_rows(app, pending);
+    flush_pending_scroll(app, pending);
+}
+
+fn flush_pending_rows(app: &mut App, pending: &mut PendingInput) {
+    if pending.row_delta != 0 {
+        let delta = pending.row_delta;
+        pending.row_delta = 0;
+        app.move_selection(delta);
+    }
+}
+
+fn flush_pending_scroll(app: &mut App, pending: &mut PendingInput) {
+    if pending.scroll_delta != 0 {
+        let delta = pending.scroll_delta;
+        pending.scroll_delta = 0;
+        app.scroll_active_layer(delta);
+    }
 }
 
 fn handle_search_input(app: &mut App, key: &KeyEvent) -> bool {
@@ -2131,22 +2248,12 @@ fn perform_action(app: &mut App, action: Action) -> bool {
         }
         Action::ScrollDown => {
             app.awaiting_gg = false;
-            if app.help_open {
-                app.help_scroll = (app.help_scroll.saturating_add(1)).min(app.help_scroll_limit());
-            } else if let Some(max) = app.detail.as_ref().map(|_| app.detail_scroll_limit()) {
-                if let Some(detail) = app.detail.as_mut() {
-                    detail.scroll = (detail.scroll.saturating_add(1)).min(max);
-                }
-            }
+            app.scroll_active_layer(1);
             false
         }
         Action::ScrollUp => {
             app.awaiting_gg = false;
-            if app.help_open {
-                app.help_scroll = app.help_scroll.saturating_sub(1);
-            } else if let Some(detail) = app.detail.as_mut() {
-                detail.scroll = detail.scroll.saturating_sub(1);
-            }
+            app.scroll_active_layer(-1);
             false
         }
         Action::ResumeLive => {
@@ -2253,17 +2360,19 @@ fn ingest_persisted_events(
     persisted_events: Vec<PersistedEvent>,
     last_history_id: &mut i64,
 ) {
+    let before = app.snapshot_visible_keys();
     for persisted in persisted_events {
         *last_history_id = (*last_history_id).max(persisted.id);
         let event_time = persisted.event.timestamp.unwrap_or(persisted.observed_at);
         let warnings = tracker.on_event(&persisted.event, event_time);
-        app.ingest_event(persisted.event, persisted.observed_at);
+        app.ingest_event_record(persisted.event, persisted.observed_at);
         for warning in warnings {
             if app.filters.time.contains(Some(event_time)) {
-                app.ingest_warning(warning, event_time);
+                app.ingest_notice_record(NoticeKind::Stale(warning), event_time);
             }
         }
     }
+    app.reconcile_after_data_change(before);
 }
 
 fn rebuild_history_view(
@@ -2295,11 +2404,13 @@ fn restore_history(
 
     let restored = history.load_recent()?;
     let restored_count = restored.len();
+    let before = app.snapshot_visible_keys();
     for persisted in restored {
         let event_time = persisted.event.timestamp.unwrap_or(persisted.observed_at);
         tracker.on_event(&persisted.event, event_time);
-        app.ingest_event(persisted.event, persisted.observed_at);
+        app.ingest_event_record(persisted.event, persisted.observed_at);
     }
+    app.reconcile_after_data_change(before);
     Ok(restored_count)
 }
 
@@ -2749,6 +2860,14 @@ fn list_scroll_offset(index: usize, scrolloff: usize) -> usize {
         return 0;
     }
     index.saturating_sub(scrolloff)
+}
+
+fn clamp_signed_delta(current: usize, delta: isize, max: usize) -> usize {
+    if delta >= 0 {
+        current.saturating_add(delta as usize).min(max)
+    } else {
+        current.saturating_sub(delta.unsigned_abs()).min(max)
+    }
 }
 
 fn kind_label(kind: &ToolEventKind) -> &'static str {
@@ -3206,6 +3325,61 @@ mod tests {
             let ts = event.timestamp.unwrap();
             app.ingest_event(event, ts);
         }
+    }
+
+    #[test]
+    fn repeated_navigation_input_is_coalesced_before_redraw() {
+        let mut app = app();
+        seed_many_events(&mut app, 20);
+        app.current_tab = Tab::Sessions;
+        app.resume_live();
+
+        let rows = app.visible_rows(Tab::Sessions);
+        let expected = rows[7].key.clone();
+        let mut pending = PendingInput::default();
+        for _ in 0..7 {
+            assert!(!process_key_input(
+                &mut app,
+                &KeyEvent::from(KeyCode::Char('j')),
+                &mut pending,
+            ));
+        }
+
+        assert_eq!(
+            app.tab_state(Tab::Sessions).selected,
+            Some(rows[0].key.clone())
+        );
+        assert_eq!(pending.row_delta, 7);
+        flush_pending_input(&mut app, &mut pending);
+        assert_eq!(app.tab_state(Tab::Sessions).selected, Some(expected));
+        assert_eq!(pending.row_delta, 0);
+    }
+
+    #[test]
+    fn non_navigation_input_flushes_coalesced_navigation_first() {
+        let mut app = app();
+        seed_many_events(&mut app, 20);
+        app.current_tab = Tab::Sessions;
+        app.resume_live();
+
+        let expected = app.visible_rows(Tab::Sessions)[3].key.clone();
+        let mut pending = PendingInput::default();
+        for _ in 0..3 {
+            assert!(!process_key_input(
+                &mut app,
+                &KeyEvent::from(KeyCode::Char('j')),
+                &mut pending,
+            ));
+        }
+        assert!(!process_key_input(
+            &mut app,
+            &KeyEvent::from(KeyCode::Char('2')),
+            &mut pending,
+        ));
+
+        assert_eq!(app.tab_state(Tab::Sessions).selected, Some(expected));
+        assert_eq!(app.current_tab, Tab::Calls);
+        assert_eq!(pending.row_delta, 0);
     }
 
     #[test]
