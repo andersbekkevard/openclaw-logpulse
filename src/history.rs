@@ -12,6 +12,7 @@ pub const HISTORY_LIMIT: usize = 10_000;
 pub struct PersistedEvent {
     pub id: i64,
     pub observed_at: DateTime<Utc>,
+    pub event_index: Option<usize>,
     pub event: NormalizedEvent,
 }
 
@@ -160,7 +161,7 @@ impl PersistedHistory {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, observed_at, event_json
+                "SELECT id, observed_at, event_json, event_index
                  FROM persisted_history
                  WHERE id > ?1
                  ORDER BY id ASC
@@ -173,6 +174,7 @@ impl PersistedHistory {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
                 ))
             })
             .map_err(sqlite_error)?;
@@ -183,7 +185,7 @@ impl PersistedHistory {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, observed_at, event_json
+                "SELECT id, observed_at, event_json, event_index
                  FROM persisted_history
                  ORDER BY id DESC
                  LIMIT ?1",
@@ -195,6 +197,7 @@ impl PersistedHistory {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
                 ))
             })
             .map_err(sqlite_error)?,
@@ -386,14 +389,15 @@ fn parse_timestamp_rusqlite(value: &str) -> rusqlite::Result<DateTime<Utc>> {
 
 fn load_events_from_rows<F>(rows: rusqlite::MappedRows<'_, F>) -> io::Result<Vec<PersistedEvent>>
 where
-    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<(i64, String, String)>,
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<(i64, String, String, Option<i64>)>,
 {
     let mut restored = Vec::new();
     for row in rows {
-        let (id, observed_at, event_json) = row.map_err(sqlite_error)?;
+        let (id, observed_at, event_json, event_index) = row.map_err(sqlite_error)?;
         restored.push(PersistedEvent {
             id,
             observed_at: parse_timestamp(&observed_at)?,
+            event_index: event_index.map(|value| value.max(0) as usize),
             event: serde_json::from_str(&event_json).map_err(json_error)?,
         });
     }

@@ -2,6 +2,7 @@ use crate::cli::Args;
 use crate::daemon;
 use crate::event::{NormalizedEvent, Severity, TimeFilter, ToolEventKind};
 use crate::history::{PersistedEvent, PersistedHistory, HISTORY_LIMIT};
+use crate::normalizer::normalize_many_with_source;
 use crate::projection::{
     call_activity_at, CallStatus, CorrelatedCall, EventRow, HealthConfig, HealthStatus,
     MatchConfidence, ProjectionFilter, ProjectionStore, SessionLabelKind, SessionSummary,
@@ -25,6 +26,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, stdout};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 const DRAIN_PER_TICK: usize = 128;
@@ -2387,9 +2389,10 @@ fn ingest_persisted_events(
     let before = app.snapshot_visible_keys();
     for persisted in persisted_events {
         *last_history_id = (*last_history_id).max(persisted.id);
-        let event_time = persisted.event.timestamp.unwrap_or(persisted.observed_at);
-        let warnings = tracker.on_event(&persisted.event, event_time);
-        app.ingest_event_record(persisted.event, persisted.observed_at);
+        let event = rehydrate_persisted_event(persisted);
+        let event_time = event.event.timestamp.unwrap_or(event.observed_at);
+        let warnings = tracker.on_event(&event.event, event_time);
+        app.ingest_event_record(event.event, event.observed_at);
         for warning in warnings {
             if app.filters.time.contains(Some(event_time)) {
                 app.ingest_notice_record(NoticeKind::Stale(warning), event_time);
@@ -2463,12 +2466,49 @@ fn restore_history(
     let restored_count = restored.len();
     let before = app.snapshot_visible_keys();
     for persisted in restored {
-        let event_time = persisted.event.timestamp.unwrap_or(persisted.observed_at);
-        tracker.on_event(&persisted.event, event_time);
-        app.ingest_event_record(persisted.event, persisted.observed_at);
+        let event = rehydrate_persisted_event(persisted);
+        let event_time = event.event.timestamp.unwrap_or(event.observed_at);
+        tracker.on_event(&event.event, event_time);
+        app.ingest_event_record(event.event, event.observed_at);
     }
     app.reconcile_after_data_change(before);
     Ok(restored_count)
+}
+
+fn rehydrate_persisted_event(mut persisted: PersistedEvent) -> PersistedEvent {
+    if !should_rehydrate_response_item(&persisted.event.raw_line) {
+        return persisted;
+    }
+
+    let source_path = persisted.event.source_path.as_deref().map(Path::new);
+    let mut events = normalize_many_with_source(&persisted.event.raw_line, source_path);
+    if events.is_empty() {
+        return persisted;
+    }
+
+    let repaired = persisted
+        .event_index
+        .and_then(|index| events.get(index).cloned())
+        .or_else(|| {
+            persisted.event.call_id.as_ref().and_then(|call_id| {
+                events
+                    .iter()
+                    .find(|event| event.call_id.as_ref() == Some(call_id))
+                    .cloned()
+            })
+        })
+        .or_else(|| (events.len() == 1).then(|| events.remove(0)));
+
+    if let Some(repaired) = repaired {
+        persisted.event = repaired;
+    }
+    persisted
+}
+
+fn should_rehydrate_response_item(raw_line: &str) -> bool {
+    raw_line.contains("\"type\":\"response_item\"")
+        || raw_line.contains("\"type\":\"response.output_item")
+        || raw_line.contains("\"type\":\"response.function_call")
 }
 
 fn render(frame: &mut Frame, app: &mut App) {
@@ -3176,7 +3216,7 @@ fn format_filters(args: &Args) -> String {
 mod tests {
     use super::*;
     use crate::discord::{DiscordLookup, DiscordLookupError};
-    use crate::history::PersistedHistory;
+    use crate::history::{PersistedHistory, SourceEventPosition};
     use crate::normalizer::normalize_many_with_source;
     use crate::session_identity::SessionRoutingMetadata;
     use crate::session_label::SessionLabelResolver;
@@ -3658,6 +3698,73 @@ mod tests {
             event_refs,
             vec!["event-2".to_string(), "event-1".to_string()]
         );
+
+        fs::remove_dir_all(path.parent().expect("parent")).expect("cleanup");
+    }
+
+    #[test]
+    fn restore_history_renormalizes_cached_codex_response_items() {
+        let path = history_path();
+        let mut history = PersistedHistory::open(&path).expect("open history");
+        let session_id = "rollout-2026-05-20T18-01-58-019e468d-2f56-75e2-85d4-2d0a771f796e";
+        let source_path = "/home/anders/.openclaw/agents/main/agent/codex-home/sessions/2026/05/20/rollout-2026-05-20T18-01-58-019e468d-2f56-75e2-85d4-2d0a771f796e.jsonl";
+        let start_raw = r#"{"timestamp":"2026-05-20T18:14:13.273Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"pnpm --version\",\"workdir\":\"/home/anders/project\"}","call_id":"call_pnpm"}}"#;
+        let result_raw = r#"{"timestamp":"2026-05-20T18:14:16.171Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_pnpm","output":"Chunk ID: 5fbe73\nWall time: 0.2987 seconds\nProcess exited with code 0\nOutput:\n11.1.0\n"}}"#;
+
+        for (offset, raw_line) in [(0, start_raw), (1, result_raw)] {
+            let mut stale = event(
+                session_id,
+                None,
+                "",
+                None,
+                ToolEventKind::Other,
+                "2026-05-20T18:14:13.273Z",
+            );
+            stale.source_path = Some(source_path.to_string());
+            stale.source_kind = Some("session_log".to_string());
+            stale.raw_line = raw_line.to_string();
+            stale.tool_name = None;
+            stale.status = None;
+            stale.call_id = None;
+            stale.call_ids.clear();
+            stale.params.clear();
+            stale.args_preview.clear();
+            stale.message = None;
+            history
+                .append_source_event(
+                    stale.timestamp.expect("timestamp"),
+                    &stale,
+                    SourceEventPosition {
+                        source_key: "codex-rollout-source",
+                        source_path,
+                        offset,
+                        event_index: 0,
+                    },
+                )
+                .expect("append stale cached event");
+        }
+
+        let mut app = app();
+        let mut tracker = StaleTracker::new(30);
+        restore_history(&mut app, &mut tracker, &history, false).expect("restore history");
+
+        let call_row = app
+            .visible_rows(Tab::Calls)
+            .into_iter()
+            .next()
+            .expect("call row");
+        assert_eq!(call_row.cells[1], "succeeded");
+        assert_eq!(call_row.cells[5], "exec_command");
+        assert_eq!(call_row.cells[6], "call_pnpm");
+        assert_eq!(call_row.cells[8], "cmd=pnpm --version");
+
+        let event_rows = app.visible_rows(Tab::Events);
+        assert!(event_rows
+            .iter()
+            .any(|row| row.cells[1] == "START" && row.cells[4] == "exec_command"));
+        assert!(event_rows
+            .iter()
+            .any(|row| row.cells[1] == "RESULT" && row.cells[4] == "exec_command"));
 
         fs::remove_dir_all(path.parent().expect("parent")).expect("cleanup");
     }
