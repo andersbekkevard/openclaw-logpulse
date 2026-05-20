@@ -202,8 +202,7 @@ fn daemon_pid_is_running(pid: u32) -> bool {
             .filter(|part| !part.is_empty())
             .map(|part| String::from_utf8_lossy(part).into_owned())
             .collect::<Vec<_>>();
-        return args.iter().any(|arg| arg.contains("logpulse"))
-            && args.iter().any(|arg| arg == "daemon");
+        args.iter().any(|arg| arg.contains("logpulse")) && args.iter().any(|arg| arg == "daemon")
     }
 
     #[cfg(not(target_os = "linux"))]

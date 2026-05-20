@@ -277,10 +277,18 @@ impl AppModel {
             .iter()
             .filter(|record| event_matches_filter(record, filter))
             .map(|record| {
+                let correlated_call = self.correlated_call_for_event(&record.event);
                 let label_info = record
                     .event
                     .durable_session_id()
                     .map(|session_id| SessionLabel::from_event(&record.event, session_id));
+                let call_ids = record
+                    .event
+                    .all_call_ids()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                let preview = event_preview(&record.event)
+                    .or_else(|| correlated_call.and_then(|call| call.message_preview.clone()));
 
                 EventRow {
                     event_ref: record.event_ref.clone(),
@@ -289,7 +297,11 @@ impl AppModel {
                     session_label: label_info.as_ref().map(|label| label.display.clone()),
                     session_label_info: label_info,
                     agent_id: record.event.agent_id.clone(),
-                    tool_name: record.event.tool_name.clone(),
+                    tool_name: record
+                        .event
+                        .tool_name
+                        .clone()
+                        .or_else(|| correlated_call.and_then(|call| call.tool_name.clone())),
                     kind: record.event.kind.clone(),
                     status: record
                         .event
@@ -297,8 +309,8 @@ impl AppModel {
                         .clone()
                         .or(record.event.result_summary.clone()),
                     severity: record.event.level,
-                    call_ids: record.event.all_call_ids().map(str::to_string).collect(),
-                    preview: event_preview(&record.event),
+                    call_ids,
+                    preview,
                     is_system_event: false,
                 }
             })
@@ -748,6 +760,15 @@ impl AppModel {
         }
 
         mutate(call);
+    }
+
+    fn correlated_call_for_event(&self, event: &NormalizedEvent) -> Option<&CallAggregate> {
+        let session_id = event.durable_session_id()?;
+        event.all_call_ids().find_map(|call_id| {
+            self.explicit_index
+                .get(&(session_id.to_string(), call_id.to_string()))
+                .and_then(|entity_id| self.calls.get(entity_id))
+        })
     }
 }
 

@@ -283,6 +283,11 @@ fn normalize_json(raw: &str, value: &Value, source_path: Option<&Path>) -> Vec<N
 
     let source_context = SourceContext::from_path(source_path);
 
+    let codex_rollout_events = normalize_codex_rollout_event(raw, value, &source_context);
+    if !codex_rollout_events.is_empty() {
+        return codex_rollout_events;
+    }
+
     let transcript_events = normalize_transcript_event(raw, value, source_path, &source_context);
     if !transcript_events.is_empty() {
         return transcript_events;
@@ -407,6 +412,164 @@ fn session_id_from_file_name(file_name: &str) -> Option<String> {
     file_name
         .split_once(".jsonl.")
         .map(|(base, _)| base.to_string())
+}
+
+fn normalize_codex_rollout_event(
+    raw: &str,
+    value: &Value,
+    source_context: &SourceContext,
+) -> Vec<NormalizedEvent> {
+    let Some(entry_type) = value.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+
+    let container = if entry_type == "response_item" {
+        value.get("payload")
+    } else if entry_type.starts_with("response.") {
+        value
+            .get("item")
+            .or_else(|| value.get("output_item"))
+            .or_else(|| value.get("payload").and_then(|payload| payload.get("item")))
+    } else {
+        None
+    };
+    let Some(container) = container else {
+        return Vec::new();
+    };
+    let Some(payload_type) = container.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+
+    let (timestamp, timestamp_raw) = parse_timestamp(value);
+    let session_identity = build_session_identity(
+        source_context
+            .session_id
+            .as_deref()
+            .map(|value| (value, "path")),
+        None,
+        None,
+    );
+    let base_event = |kind: ToolEventKind,
+                      tool_name: Option<String>,
+                      status: Option<String>,
+                      result_summary: Option<String>,
+                      result_preview: Option<String>,
+                      params: Vec<(String, String)>,
+                      args_raw: Option<Value>| {
+        NormalizedEvent {
+            kind,
+            timestamp,
+            timestamp_raw: timestamp_raw.clone(),
+            session_label: session_identity.session_label.clone(),
+            session_id: session_identity.session_id.clone(),
+            session_source: session_identity.session_source.clone(),
+            session_label_source: session_identity.session_label_source.clone(),
+            session_identity_conflicts: session_identity.conflicts.clone(),
+            agent_id: source_context.agent_id.clone(),
+            agent_source: source_context.agent_id.as_ref().map(|_| "path".to_string()),
+            tool_name,
+            status,
+            result_summary,
+            result_preview,
+            call_id: first_string_from_paths(container, &[&["call_id"], &["callId"]]),
+            call_ids: first_string_from_paths(container, &[&["call_id"], &["callId"]])
+                .into_iter()
+                .collect(),
+            correlation_ids: Vec::new(),
+            level: Severity::Info,
+            level_raw: Some("info".to_string()),
+            params: params.clone(),
+            args_preview: params,
+            args_raw,
+            source_kind: Some("codex_rollout".to_string()),
+            message: None,
+            raw_line: raw.to_string(),
+            ..empty_event(raw.to_string())
+        }
+    };
+
+    match payload_type {
+        "function_call" => {
+            let arguments = container
+                .get("arguments")
+                .or_else(|| container.get("input"));
+            let (params, args_raw) = extract_codex_arguments(arguments);
+            let tool_name = first_string_from_paths(container, &[&["name"]]).map(|name| {
+                container
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .map(|namespace| format!("{namespace}.{name}"))
+                    .unwrap_or(name)
+            });
+            let status = first_string_from_paths(container, &[&["status"]])
+                .or_else(|| Some("started".to_string()));
+
+            vec![base_event(
+                ToolEventKind::ToolCallStart,
+                tool_name,
+                status,
+                None,
+                None,
+                params,
+                args_raw,
+            )]
+        }
+        "function_call_output" => {
+            let output = first_string_from_paths(container, &[&["output"], &["result"]]);
+            let status = first_string_from_paths(container, &[&["status"]])
+                .or_else(|| output.as_deref().and_then(codex_output_status));
+            vec![base_event(
+                ToolEventKind::ToolCallResult,
+                None,
+                status,
+                output.clone(),
+                output.map(|value| truncate(&value, MAX_PARAM_VALUE_LENGTH)),
+                Vec::new(),
+                None,
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn extract_codex_arguments(value: Option<&Value>) -> (Vec<(String, String)>, Option<Value>) {
+    let Some(value) = value else {
+        return (Vec::new(), None);
+    };
+
+    match value {
+        Value::String(text) => match serde_json::from_str::<Value>(text) {
+            Ok(parsed) => (extract_params_from_value(&parsed), Some(parsed)),
+            Err(_) => (
+                vec![(
+                    "arguments".to_string(),
+                    truncate(text, MAX_PARAM_VALUE_LENGTH),
+                )],
+                Some(value.clone()),
+            ),
+        },
+        value => (extract_params_from_value(value), Some(value.clone())),
+    }
+}
+
+fn codex_output_status(output: &str) -> Option<String> {
+    if output.contains("Process running with session ID") {
+        return Some("running".to_string());
+    }
+
+    let marker = "Process exited with code ";
+    let start = output.find(marker).map(|index| index + marker.len())?;
+    let code = output[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+        .collect::<String>();
+    if code == "0" {
+        Some("completed".to_string())
+    } else if code.is_empty() {
+        None
+    } else {
+        Some("failed".to_string())
+    }
 }
 
 fn normalize_transcript_event(
@@ -1207,6 +1370,77 @@ mod tests {
         assert_eq!(normalized.status.as_deref(), Some("completed"));
         assert_eq!(normalized.params.len(), 3);
         assert!(normalized.result_summary.is_some());
+    }
+
+    #[test]
+    fn parse_codex_rollout_function_call_and_output() {
+        let source_path = Path::new(
+            "/home/anders/.openclaw/agents/main/agent/codex-home/sessions/2026/05/20/rollout-2026-05-20T18-01-58-019e468d-2f56-75e2-85d4-2d0a771f796e.jsonl",
+        );
+        let call_line = r#"{"timestamp":"2026-05-20T18:14:13.273Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"pnpm --version\",\"workdir\":\"/home/anders/project\",\"yield_time_ms\":1000}","call_id":"call_F5fBoBFaaM44RY2uyBoGyX8w"}}"#;
+        let output_line = r#"{"timestamp":"2026-05-20T18:14:16.171Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_F5fBoBFaaM44RY2uyBoGyX8w","output":"Chunk ID: 5fbe73\nWall time: 0.2987 seconds\nProcess exited with code 0\nOriginal token count: 2\nOutput:\n11.1.0\n"}}"#;
+
+        let call = normalize_with_source(call_line, Some(source_path));
+        let output = normalize_with_source(output_line, Some(source_path));
+
+        assert!(matches!(
+            call.kind,
+            crate::event::ToolEventKind::ToolCallStart
+        ));
+        assert_eq!(call.source_kind.as_deref(), Some("codex_rollout"));
+        assert_eq!(
+            call.session_id.as_deref(),
+            Some("rollout-2026-05-20T18-01-58-019e468d-2f56-75e2-85d4-2d0a771f796e")
+        );
+        assert_eq!(call.agent_id.as_deref(), Some("main"));
+        assert_eq!(call.tool_name.as_deref(), Some("exec_command"));
+        assert_eq!(
+            call.call_id.as_deref(),
+            Some("call_F5fBoBFaaM44RY2uyBoGyX8w")
+        );
+        assert_eq!(call.status.as_deref(), Some("started"));
+        assert!(call
+            .params
+            .iter()
+            .any(|(key, value)| key == "cmd" && value == "pnpm --version"));
+
+        assert!(matches!(
+            output.kind,
+            crate::event::ToolEventKind::ToolCallResult
+        ));
+        assert_eq!(
+            output.call_id.as_deref(),
+            Some("call_F5fBoBFaaM44RY2uyBoGyX8w")
+        );
+        assert_eq!(output.status.as_deref(), Some("completed"));
+        assert!(output
+            .result_preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Process exited with code 0"));
+    }
+
+    #[test]
+    fn parse_openai_response_output_item_function_call() {
+        let line = r#"{"type":"response.output_item.added","timestamp":"2026-05-20T18:14:13.273Z","item":{"type":"function_call","name":"web_search","call_id":"call_search","status":"in_progress","arguments":"{\"query\":\"logpulse status\"}"}}"#;
+        let normalized = normalize_with_source(
+            line,
+            Some(Path::new(
+                "/home/anders/.openclaw/agents/main/agent/codex-home/sessions/2026/05/20/rollout-2026-05-20T18-01-58-019e468d-2f56-75e2-85d4-2d0a771f796e.jsonl",
+            )),
+        );
+
+        assert!(matches!(
+            normalized.kind,
+            crate::event::ToolEventKind::ToolCallStart
+        ));
+        assert_eq!(normalized.tool_name.as_deref(), Some("web_search"));
+        assert_eq!(normalized.call_id.as_deref(), Some("call_search"));
+        assert_eq!(normalized.status.as_deref(), Some("in_progress"));
+        assert_eq!(
+            normalized.params,
+            vec![("query".to_string(), "logpulse status".to_string())]
+        );
     }
 
     #[test]

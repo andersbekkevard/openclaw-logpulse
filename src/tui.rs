@@ -3123,7 +3123,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use std::fs;
     use std::io;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
@@ -3783,6 +3783,55 @@ mod tests {
             .expect("session row");
         assert!(["idle", "busy", "stale"].contains(&session_row.cells[3].as_str()));
         assert!(["live", "quiet", "missing", "unknown"].contains(&session_row.cells[4].as_str()));
+    }
+
+    #[test]
+    fn codex_rollout_rows_populate_tool_call_status_and_preview_columns() {
+        let mut app = app();
+        let source_path = Path::new(
+            "/home/anders/.openclaw/agents/main/agent/codex-home/sessions/2026/05/20/rollout-2026-05-20T18-01-58-019e468d-2f56-75e2-85d4-2d0a771f796e.jsonl",
+        );
+        let lines = [
+            r#"{"timestamp":"2026-05-20T18:14:13.273Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"pnpm --version\",\"workdir\":\"/home/anders/project\"}","call_id":"call_pnpm"}}"#,
+            r#"{"timestamp":"2026-05-20T18:14:16.171Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_pnpm","output":"Chunk ID: 5fbe73\nWall time: 0.2987 seconds\nProcess exited with code 0\nOutput:\n11.1.0\n"}}"#,
+        ];
+
+        for line in lines {
+            for event in normalize_many_with_source(line, Some(source_path)) {
+                let ts = event.timestamp.expect("timestamp");
+                app.ingest_event(event, ts);
+            }
+        }
+
+        let event_rows = app.visible_rows(Tab::Events);
+        let start_row = event_rows
+            .iter()
+            .find(|row| row.cells[1] == "START")
+            .expect("start row");
+        let result_row = event_rows
+            .iter()
+            .find(|row| row.cells[1] == "RESULT")
+            .expect("result row");
+
+        assert_eq!(start_row.cells[4], "exec_command");
+        assert_eq!(start_row.cells[5], "call_pnpm");
+        assert_eq!(start_row.cells[6], "started");
+        assert_eq!(start_row.cells[7], "cmd=pnpm --version");
+        assert_eq!(result_row.cells[4], "exec_command");
+        assert_eq!(result_row.cells[5], "call_pnpm");
+        assert_eq!(result_row.cells[6], "completed");
+        assert!(result_row.cells[7].contains("Process exited with code 0"));
+
+        let call_row = app
+            .visible_rows(Tab::Calls)
+            .into_iter()
+            .next()
+            .expect("call row");
+        assert_eq!(call_row.cells[1], "succeeded");
+        assert_eq!(call_row.cells[2], "id");
+        assert_eq!(call_row.cells[5], "exec_command");
+        assert_eq!(call_row.cells[6], "call_pnpm");
+        assert_eq!(call_row.cells[8], "cmd=pnpm --version");
     }
 
     #[test]
