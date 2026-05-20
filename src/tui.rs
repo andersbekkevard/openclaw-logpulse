@@ -1654,22 +1654,24 @@ impl App {
         };
         let display_label =
             self.display_session_label(Some(&call.session_id), Some(&call.session_label));
-        Text::from(vec![
+        let mut lines = vec![
             title_line(
-                &format!("CALL {}", call.tool_name.as_deref().unwrap_or("-")),
+                &call_title(&call),
                 tool_color(call.tool_name.as_deref().unwrap_or("call")),
             ),
+            kv_line("Display ID", &call_identity_label(&call)),
             kv_line("Entity ID", &call.call_entity_id),
             kv_line("Surface", &display_label),
             kv_line("Session ID", &call.session_id),
-            match call.session_label_info.kind {
+            match call.session_label_info.kind.clone() {
                 SessionLabelKind::DiscordChannelId => kv_line(
                     "Discord Channel ID",
                     call.session_label_info.channel_id.as_deref().unwrap_or("-"),
                 ),
                 SessionLabelKind::StableSessionId => kv_line("Session Label Source", "non-discord"),
             },
-            kv_line("Status", call_status_label(call.status)),
+            kv_line("Tool", call.tool_name.as_deref().unwrap_or("unknown")),
+            kv_line("Status", call_status_label(call.status.clone())),
             kv_line(
                 "Confidence",
                 match call.match_confidence {
@@ -1678,7 +1680,22 @@ impl App {
                     MatchConfidence::FallbackSignature => "fallback_signature",
                 },
             ),
-            kv_line("Call ID", call.canonical_call_id.as_deref().unwrap_or("-")),
+            kv_line(
+                "Call ID",
+                call.canonical_call_id
+                    .as_deref()
+                    .unwrap_or("missing in source log"),
+            ),
+        ];
+
+        if call.match_confidence == MatchConfidence::FallbackSignature {
+            lines.push(kv_line(
+                "Fallback signature",
+                call.fallback_signature.as_deref().unwrap_or("<unknown>"),
+            ));
+        }
+
+        lines.extend([
             kv_line(
                 "Started",
                 &call
@@ -1710,7 +1727,14 @@ impl App {
                     call.event_refs_related.len()
                 ),
             ),
-        ])
+        ]);
+
+        if let Some(note) = call_metadata_note(&call) {
+            lines.push(section_header("Why"));
+            lines.push(Line::from(note));
+        }
+
+        Text::from(lines)
     }
 
     fn session_text(&self, session_id: &str) -> Text<'static> {
@@ -2927,6 +2951,42 @@ fn call_label(call: &CorrelatedCall) -> String {
         .unwrap_or_else(|| compact_id(&call.call_entity_id, 12))
 }
 
+fn call_identity_label(call: &CorrelatedCall) -> String {
+    call.canonical_call_id
+        .as_deref()
+        .map(|call_id| compact_id(call_id, 24))
+        .unwrap_or_else(|| format!("inferred:{}", compact_id(&call.call_entity_id, 16)))
+}
+
+fn call_title(call: &CorrelatedCall) -> String {
+    match call.tool_name.as_deref() {
+        Some(tool) => format!("CALL {} {}", tool, call_identity_label(call)),
+        None => format!("CALL {}", call_identity_label(call)),
+    }
+}
+
+fn call_metadata_note(call: &CorrelatedCall) -> Option<Span<'static>> {
+    if call.canonical_call_id.is_none()
+        && call.tool_name.is_none()
+        && call.event_refs_start.is_empty()
+        && !call.event_refs_result.is_empty()
+    {
+        return Some(Span::styled(
+            "This is a result-only fallback row. The source event did not include a tool name or call id when it was normalized, so Logpulse can only preserve an inferred row number and the result timestamp.",
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
+    if call.canonical_call_id.is_none() {
+        return Some(Span::styled(
+            "This row has no explicit call id in the source log, so Logpulse is using an inferred fallback identity.",
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
+    None
+}
+
 fn compact_id(value: &str, max_chars: usize) -> String {
     let short = value
         .rsplit([':', '|'])
@@ -3832,6 +3892,41 @@ mod tests {
         assert_eq!(call_row.cells[5], "exec_command");
         assert_eq!(call_row.cells[6], "call_pnpm");
         assert_eq!(call_row.cells[8], "cmd=pnpm --version");
+    }
+
+    #[test]
+    fn fallback_call_inspector_explains_missing_tool_call_metadata() {
+        let mut app = app();
+        let mut result = event(
+            "session-a",
+            Some("label-a"),
+            "",
+            None,
+            ToolEventKind::ToolCallResult,
+            "2026-03-07T10:00:00Z",
+        );
+        result.tool_name = None;
+        result.status = Some("ok".to_string());
+        result.params.clear();
+        result.args_preview.clear();
+        result.message = None;
+        let ts = result.timestamp.expect("timestamp");
+        app.ingest_event(result, ts);
+
+        app.current_tab = Tab::Calls;
+        app.tab_state_mut(Tab::Calls).selected = app
+            .visible_rows(Tab::Calls)
+            .first()
+            .map(|row| row.key.clone());
+
+        let inspector = inspector_string(&app);
+        assert!(inspector.contains("CALL inferred:1"));
+        assert!(inspector.contains("Display ID: inferred:1"));
+        assert!(inspector.contains("Tool: unknown"));
+        assert!(inspector.contains("Call ID: missing in source log"));
+        assert!(inspector.contains("Fallback signature: <unknown>"));
+        assert!(inspector.contains("result-only fallback row"));
+        assert!(inspector.contains("start=0 result=1 related=0"));
     }
 
     #[test]
